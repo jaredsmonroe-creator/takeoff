@@ -1,6 +1,6 @@
 {
-  "name": "Epic Takeoff",
-  "short_name": "Takeoff",
+  "name": "Take Off Tool",
+  "short_name": "Take Off Tool",
   "description": "Tap-to-measure insulation takeoffs from PDF plans",
   "start_url": "./index.html",
   "scope": "./",

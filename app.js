@@ -1,9 +1,9 @@
-/* Epic Takeoff – tap-to-measure square footage from PDF plans. No AI, no pricing. */
+/* Take Off Tool – tap-to-measure square footage from PDF plans. No AI, no pricing. */
 (function () {
   'use strict';
   const G = window.TakeoffGeom;
   const $ = id => document.getElementById(id);
-  const APP_VERSION = '1.0.0';
+  const APP_VERSION = '1.1.0';
   pdfjsLib.GlobalWorkerOptions.workerSrc = 'vendor/pdf.worker.min.js';
 
   const COLORS = ['#d62728', '#1f77b4', '#2ca02c', '#9467bd', '#ff7f0e', '#8c564b', '#e377c2', '#17becf', '#bcbd22', '#7f7f7f', '#393b79', '#e7298a'];
@@ -22,7 +22,7 @@
     view: { s: 1, tx: 0, ty: 0 },
     proj: newProject(),
     activeId: null, tool: null, toolPts: [], ortho: false,
-    renderTask: null, detailTask: null, detailTimer: 0, panelOpen: true
+    renderTask: null, detailTask: null, detailTimer: 0, panelOpen: true, selPt: null, hist: []
   };
   window.__S = S; // for testing / debugging
 
@@ -153,13 +153,18 @@
   function initGestures() {
     const el = $('viewport');
     el.addEventListener('pointerdown', e => {
-      if (!S.pdf) return;
+      if (!S.pdf || (e.target.closest && e.target.closest('#hud button'))) return; // HUD buttons are not plan taps
       el.setPointerCapture && el.setPointerCapture(e.pointerId);
       ptrs.set(e.pointerId, { x: e.clientX, y: e.clientY, type: e.pointerType });
       if (ptrs.size === 1) {
         const hit = hitVertex(e.clientX, e.clientY);
-        gest = hit ? { mode: 'drag', hit, id: e.pointerId, sx: e.clientX, sy: e.clientY, orig: hit.arr[hit.idx].slice(), moved: false } : { mode: 'pending', id: e.pointerId, sx: e.clientX, sy: e.clientY, tx: S.view.tx, ty: S.view.ty, t: Date.now() };
+        if (hit && hit.kind === 'm') gest = { mode: 'mid', hit, id: e.pointerId, sx: e.clientX, sy: e.clientY };
+        else if (hit) {
+          gest = { mode: 'drag', hit, id: e.pointerId, sx: e.clientX, sy: e.clientY, orig: hit.arr[hit.idx].slice(), moved: false };
+          if (hit.item) { const g0 = gest; g0.lpTimer = setTimeout(() => { if (gest === g0 && !g0.moved) { g0.long = true; setSel({ id: hit.item.id, si: hit.si, idx: hit.idx }); toast('Point selected – tap 🗑 Delete point to remove it'); } }, 450); }
+        } else gest = { mode: 'pending', id: e.pointerId, sx: e.clientX, sy: e.clientY, tx: S.view.tx, ty: S.view.ty, t: Date.now() };
       } else if (ptrs.size === 2) {
+        if (gest && gest.lpTimer) clearTimeout(gest.lpTimer);
         const [a, b] = [...ptrs.values()];
         gest = { mode: 'pinch', d0: Math.hypot(b.x - a.x, b.y - a.y), cx: (a.x + b.x) / 2, cy: (a.y + b.y) / 2, s0: S.view.s };
       }
@@ -180,8 +185,16 @@
         const dx = e.clientX - gest.sx, dy = e.clientY - gest.sy;
         if (gest.mode === 'pending' && Math.hypot(dx, dy) > (e.pointerType === 'pen' ? 6 : 10)) gest.mode = 'pan';
         if (gest.mode === 'pan') { S.view.tx = gest.tx + dx; S.view.ty = gest.ty + dy; applyView(); scheduleDetail(); }
+      } else if (gest.mode === 'mid') {
+        if (Math.hypot(e.clientX - gest.sx, e.clientY - gest.sy) < (e.pointerType === 'pen' ? 4 : 8)) return;
+        const h = gest.hit, arr = insertMid(h);
+        gest = { mode: 'drag', id: gest.id, hit: { kind: 'v', arr, idx: h.insertAt, item: h.item, si: h.si }, moved: true, sx: gest.sx, sy: gest.sy };
+        gest.hit.arr[gest.hit.idx] = clampPt(toStage(e.clientX, e.clientY));
+        drawOverlay(); refreshPanelLive();
       } else if (gest.mode === 'drag') {
+        if (gest.long) return;
         if (!gest.moved && Math.hypot(e.clientX - gest.sx, e.clientY - gest.sy) < (e.pointerType === 'pen' ? 4 : 8)) return;
+        if (!gest.moved) { clearTimeout(gest.lpTimer); if (gest.hit.item) snapshot(gest.hit.item); }
         gest.moved = true;
         const pt = toStage(e.clientX, e.clientY);
         gest.hit.arr[gest.hit.idx] = clampPt(pt);
@@ -194,14 +207,18 @@
       ptrs.delete(e.pointerId);
       if (!gest) return;
       if (gest.mode === 'pending' && e.type === 'pointerup' && e.pointerId === gest.id) { onTap(toStage(e.clientX, e.clientY), e.clientX, e.clientY); }
+      if (gest.lpTimer) clearTimeout(gest.lpTimer);
+      if (gest.mode === 'mid' && e.type === 'pointerup') { const h = gest.hit; insertMid(h); autosave(); renderPanel(); drawOverlay(); toast('Point added – drag it in or out'); }
       if (gest.mode === 'drag') {
-        if (!gest.moved) { gest.hit.arr[gest.hit.idx] = gest.orig; if (e.type === 'pointerup') onTap(toStage(e.clientX, e.clientY), e.clientX, e.clientY); }
-        else { autosave(); renderPanel(); }
+        if (gest.long) { /* long-press already selected the point */ }
+        else if (!gest.moved) { gest.hit.arr[gest.hit.idx] = gest.orig; if (e.type === 'pointerup') onTap(toStage(e.clientX, e.clientY), e.clientX, e.clientY); }
+        else { if (gest.hit.item) S.selPt = { id: gest.hit.item.id, si: gest.hit.si, idx: gest.hit.idx }; autosave(); renderPanel(); drawOverlay(); updateHud(); }
       }
       if (ptrs.size === 0) gest = null;
       else if (gest.mode === 'pinch') gest = { mode: 'none' };
     };
     el.addEventListener('pointerup', end); el.addEventListener('pointercancel', end);
+    el.addEventListener('contextmenu', e => e.preventDefault());
     el.addEventListener('wheel', e => { e.preventDefault(); const r = el.getBoundingClientRect(); zoomAt(e.clientX - r.left, e.clientY - r.top, Math.exp(-e.deltaY * 0.0015)); applyView(); scheduleDetail(); }, { passive: false });
     // stop Safari's own pinch-zoom of the whole page
     document.addEventListener('gesturestart', e => e.preventDefault());
@@ -209,12 +226,52 @@
   }
   function clampPt(p) { return [Math.max(0, Math.min(S.pageW, p[0])), Math.max(0, Math.min(S.pageH, p[1]))]; }
   function screenDist(p, cx, cy) { const r = $('viewport').getBoundingClientRect(); return Math.hypot(p[0] * S.view.s + S.view.tx + r.left - cx, p[1] * S.view.s + S.view.ty + r.top - cy); }
+  /* segments of a shape that get a '+' midpoint handle: [a, b, insertAt]; areas include the closing edge */
+  function segments(sh, area) {
+    const pts = sh.pts, out = [];
+    for (let i = 0; i + 1 < pts.length; i++) out.push([i, i + 1, i + 1]);
+    if (area && pts.length >= 3) out.push([pts.length - 1, 0, pts.length]);
+    return out.filter(sg => screenLen(pts[sg[0]], pts[sg[1]]) >= 50);
+  }
+  function screenLen(a, b) { return G.dist(a, b) * S.view.s; }
   function hitVertex(cx, cy) {
     const R = 20; let best = null, bd = R;
-    const test = (arr, item) => arr.forEach((p, idx) => { const d = screenDist(p, cx, cy); if (d < bd) { bd = d; best = { arr, idx, item }; } });
-    if (S.tool) test(S.toolPts, null);
-    else { const it = activeItem(); if (it && it.page === S.pageNum) it.shapes.forEach(sh => test(sh.pts, it)); }
+    const test = (arr, item, si) => arr.forEach((p, idx) => { const d = screenDist(p, cx, cy); if (d < bd) { bd = d; best = { kind: 'v', arr, idx, item, si }; } });
+    if (S.tool) { test(S.toolPts, null); return best; }
+    const it = activeItem(); if (!it || it.page !== S.pageNum) return null;
+    it.shapes.forEach((sh, si) => test(sh.pts, it, si));
+    if (best) return best;
+    let bm = 22;
+    it.shapes.forEach((sh, si) => segments(sh, G.isArea(it.type)).forEach(sg => {
+      const m = G.centroid([sh.pts[sg[0]], sh.pts[sg[1]]]); const d = screenDist(m, cx, cy);
+      if (d < bm) { bm = d; best = { kind: 'm', item: it, si, insertAt: sg[2], pt: m }; }
+    }));
     return best;
+  }
+  function insertMid(h) {
+    snapshot(h.item);
+    const arr = h.item.shapes[h.si].pts;
+    arr.splice(h.insertAt, 0, h.pt.slice());
+    S.selPt = { id: h.item.id, si: h.si, idx: h.insertAt };
+    return arr;
+  }
+  function snapshot(it) { S.hist.push({ id: it.id, shapes: JSON.stringify(it.shapes) }); if (S.hist.length > 200) S.hist.shift(); }
+  function validSel() {
+    const sp = S.selPt, it = activeItem();
+    if (!sp || !it || sp.id !== it.id || it.page !== S.pageNum || !it.shapes[sp.si] || !it.shapes[sp.si].pts[sp.idx]) return null;
+    return sp;
+  }
+  function setSel(sp) { S.selPt = sp; drawOverlay(); updateHud(); renderEditor(); }
+  function deletePoint() {
+    const sp = validSel(); if (!sp) { toast('Press and hold a point to select it first'); return; }
+    const it = activeItem(); const sh = it.shapes[sp.si];
+    snapshot(it);
+    if (sh.autoPt && (sp.idx === 0 || sp.idx === sh.pts.length - 1)) { sh.pts.pop(); sh.autoPt = false; sh.closed = false; if (sp.idx === 0) sh.pts.shift(); }
+    else sh.pts.splice(sp.idx, 1);
+    if (!sh.pts.length) it.shapes.splice(sp.si, 1);
+    else if (G.isArea(it.type) && sh.pts.length < 3) sh.closed = false;
+    S.selPt = null;
+    autosave(); drawOverlay(); renderPanel(); updateHud();
   }
 
   /* ---------------- tapping / drawing ---------------- */
@@ -235,6 +292,7 @@
       it.page = S.pageNum;
     }
     if (!scaleOf(S.pageNum)) toast('Scale not set on this page yet – tap 📏 Set Scale', 2500);
+    snapshot(it); S.selPt = null; updateHud();
     let sh = it.shapes[it.shapes.length - 1];
     if (!sh || sh.closed) { sh = { pts: [], closed: false }; it.shapes.push(sh); }
     // tap on the first point: closes an area shape / snaps a wall run closed
@@ -261,7 +319,7 @@
       it.height = S.proj.lastHeights[it.floor] !== undefined ? S.proj.lastHeights[it.floor] : DEFAULT_HEIGHT[it.floor];
       if (type === 'wall') it.name = 'Main walls' + (count > 1 ? ' ' + count : '');
     }
-    S.proj.items.push(it); S.activeId = it.id;
+    S.proj.items.push(it); S.activeId = it.id; S.selPt = null;
     autosave(); renderPanel(); drawOverlay();
     if (!S.panelOpen) togglePanel(true);
     toast(G.isArea(type) ? 'Tap each corner. Tap the first point to close.' : 'Tap along the wall. Use "New run" for a separate wall.', 2800);
@@ -276,6 +334,10 @@
   function undoPoint() {
     if (S.tool) { S.toolPts.pop(); drawOverlay(); updateHud(); return; }
     const it = activeItem(); if (!it) return;
+    S.selPt = null;
+    for (let i = S.hist.length - 1; i >= 0; i--) {
+      if (S.hist[i].id === it.id) { it.shapes = JSON.parse(S.hist[i].shapes); S.hist.splice(i, 1); autosave(); drawOverlay(); renderPanel(); updateHud(); return; }
+    }
     let sh = it.shapes[it.shapes.length - 1];
     if (!sh) return;
     if (sh.closed) { sh.closed = false; if (sh.autoPt) { sh.pts.pop(); sh.autoPt = false; } } else sh.pts.pop();
@@ -285,13 +347,13 @@
   function newSection() {
     const it = activeItem(); if (!it) return;
     const sh = it.shapes[it.shapes.length - 1];
-    if (sh && sh.pts.length) { sh.closed = true; }
+    if (sh && sh.pts.length && !sh.closed) { snapshot(it); sh.closed = true; }
     toast(G.isArea(it.type) ? 'Tap corners of the next section' : 'Tap the start of the next wall run');
     drawOverlay(); renderPanel();
   }
   function selectItem(id) {
     finishTool();
-    S.activeId = S.activeId === id ? null : id;
+    S.activeId = S.activeId === id ? null : id; S.selPt = null;
     const it = activeItem();
     if (it && it.page !== S.pageNum && it.shapes.length) showPage(it.page);
     renderPanel(); drawOverlay();
@@ -308,7 +370,7 @@
       if (it.page !== S.pageNum) return;
       const active = it.id === S.activeId;
       const g = svgEl('g', {});
-      it.shapes.forEach(sh => {
+      it.shapes.forEach((sh, si) => {
         const pts = sh.pts; if (!pts.length) return;
         const ps = pts.map(p => p[0].toFixed(2) + ',' + p[1].toFixed(2)).join(' ');
         if (G.isArea(it.type)) {
@@ -317,7 +379,16 @@
         } else {
           g.appendChild(svgEl('polyline', { points: ps, fill: 'none', stroke: it.color, 'stroke-width': active ? 5 : 4, 'stroke-opacity': 0.85, 'stroke-linejoin': 'round', 'stroke-linecap': 'round', 'vector-effect': 'non-scaling-stroke' }));
         }
-        if (active) pts.forEach((p, i) => g.appendChild(svgEl('circle', { cx: p[0], cy: p[1], r: (i === 0 ? 9 : 7) * k, fill: i === pts.length - 1 ? '#ffd84d' : '#fff', stroke: it.color, 'stroke-width': 2, 'vector-effect': 'non-scaling-stroke' })));
+        if (active && !S.tool) segments(sh, G.isArea(it.type)).forEach(sg => {
+          const m = G.centroid([pts[sg[0]], pts[sg[1]]]);
+          g.appendChild(svgEl('circle', { cx: m[0], cy: m[1], r: 11 * k, fill: '#fff', 'fill-opacity': 0.92, stroke: it.color, 'stroke-width': 2, 'vector-effect': 'non-scaling-stroke', class: 'midh' }));
+          g.appendChild(svgEl('path', { d: 'M' + (m[0] - 6 * k) + ' ' + m[1] + 'H' + (m[0] + 6 * k) + 'M' + m[0] + ' ' + (m[1] - 6 * k) + 'V' + (m[1] + 6 * k), stroke: it.color, 'stroke-width': 3, 'stroke-linecap': 'round', 'vector-effect': 'non-scaling-stroke' }));
+        });
+        const sp = active ? validSel() : null;
+        if (active) pts.forEach((p, i) => {
+          const sel = sp && sp.si === si && sp.idx === i;
+          g.appendChild(svgEl('circle', { cx: p[0], cy: p[1], r: (sel ? 12 : i === 0 ? 9 : 7) * k, fill: sel ? '#ff3b30' : i === pts.length - 1 ? '#ffd84d' : '#fff', stroke: sel ? '#fff' : it.color, 'stroke-width': sel ? 3 : 2, 'vector-effect': 'non-scaling-stroke', class: sel ? 'selpt' : 'vtx' }));
+        });
       });
       // label
       const all = [].concat(...it.shapes.map(s => s.pts));
@@ -350,7 +421,13 @@
   /* ---------------- HUD (tools) ---------------- */
   function updateHud() {
     const h = $('hud');
-    if (!S.tool) { h.innerHTML = ''; return; }
+    if (!S.tool) {
+      if (validSel()) {
+        h.innerHTML = '<div>Point selected <button id="hudDelPt" class="danger">🗑 Delete point</button> <button id="hudDesel">✕</button></div>';
+        $('hudDelPt').onclick = deletePoint; $('hudDesel').onclick = () => setSel(null);
+      } else h.innerHTML = '';
+      return;
+    }
     const sc = scaleOf(S.pageNum);
     let msg;
     if (S.tool === 'measure') {
@@ -453,13 +530,14 @@
     $('mHelp').onclick = helpDialog;
   }
   function helpDialog() {
-    modal('<h3>How to do a takeoff</h3><ol style="line-height:1.55">' +
+    modal('<h3>Take Off Tool – how to use</h3><ol style="line-height:1.55">' +
       '<li><b>📄 Open Plan</b> → pick the PDF from Files or Google Drive.</li>' +
       '<li>Go to the page (◀ ▶ or tap the page button).</li>' +
       '<li><b>📏 Set Scale</b> → pick the scale printed on the sheet, or <b>Calibrate</b>: zoom in, tap both ends of a long dimension, type its length.</li>' +
       '<li><b>📐 Check</b> → tap both ends of another printed dimension. If it matches, you\'re good.</li>' +
       '<li>Tap <b>+ Roof</b> (pick the pitch), <b>+ Walls</b> (pick the floor and wall height), <b>+ Garage Ceiling</b>, etc.</li>' +
       '<li>Tap the corners on the plan. For areas, tap the first point to close it. <b>New section</b> adds another piece to the same line. <b>↶ Undo</b> removes the last point. Drag a white dot to fix it.</li>' +
+      '<li><b>Jogs / bump-outs:</b> tap or drag the <b>+</b> in the middle of a line to add a point, then drag it in or out. To remove a point, press and hold it, then tap <b>🗑 Delete point</b>. Undo works for all of these.</li>' +
       '<li><b>⊾ Square</b> keeps lines straight up/down or left/right.</li>' +
       '<li>Tap <b>Done</b> when that line is finished.</li>' +
       '<li><b>💾 Save</b> → Save CSV → Files → Google Drive, so Tess can build the quote.</li>' +
@@ -505,7 +583,7 @@
     h += '<label>' + (G.isLength(it.type) ? 'Deduct/add sf' : 'Add/deduct sf') + '</label><input id="edAdj" class="short" inputmode="numbers-and-punctuation" value="' + esc(it.adjust || 0) + '"></div>';
     h += '<div class="row"><span class="big" id="edSF">' + fmtSF(c.sf) + '</span><span class="sub" id="edSub">' + subText(it, c) + '</span></div>';
     h += '<div class="btns"><button id="edUndo">↶ Undo</button><button id="edSec">' + (area ? '＋ New section' : '＋ New run') + '</button><button id="edDone" class="okc">✓ Done</button></div>';
-    h += '<div class="btns"><button id="edDel" class="danger">Delete</button></div>';
+    h += '<div class="btns"><button id="edDelPt"' + (validSel() ? '' : ' disabled style="opacity:.45"') + '>🗑 Delete point</button><span></span><button id="edDel" class="danger">Delete line</button></div>';
     h += '</div>';
     ed.innerHTML = h;
     $('edName').onchange = e => { it.name = e.target.value.trim() || it.name; autosave(); renderList(); drawOverlay(); };
@@ -521,8 +599,9 @@
     $('edQty').onchange = e => { const v = parseFloat(e.target.value); it.qty = isNaN(v) ? 1 : v; changed(); };
     $('edAdj').onchange = e => { const v = parseFloat(e.target.value); it.adjust = isNaN(v) ? 0 : v; changed(); };
     $('edUndo').onclick = undoPoint; $('edSec').onclick = newSection;
-    $('edDone').onclick = () => { const sh = it.shapes[it.shapes.length - 1]; if (sh) sh.closed = true; S.activeId = null; autosave(); renderPanel(); drawOverlay(); };
+    $('edDone').onclick = () => { const sh = it.shapes[it.shapes.length - 1]; if (sh) sh.closed = true; S.activeId = null; S.selPt = null; updateHud(); autosave(); renderPanel(); drawOverlay(); };
     $('edDel').onclick = () => deleteItem(it.id);
+    $('edDelPt').onclick = deletePoint;
   }
   function subText(it, c) {
     if (c.noScale) return 'set the scale to see sf';

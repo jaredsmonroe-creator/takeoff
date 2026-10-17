@@ -70,3 +70,6 @@ button.danger { background:#c0392b; color:#fff; border-color:#c0392b; }
   .addgrid { grid-template-columns:repeat(5,1fr); }
 }
 @media (max-width: 700px) { #topbar button { font-size:14px; padding:4px 8px; } }
+
+#topbar .apptitle { color:#fff; font-weight:700; white-space:nowrap; padding:0 6px; }
+@media (max-width: 1300px) { #topbar .apptitle { display:none; } }
