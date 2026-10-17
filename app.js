@@ -3,7 +3,7 @@
   'use strict';
   const G = window.TakeoffGeom;
   const $ = id => document.getElementById(id);
-  const APP_VERSION = '1.1.0';
+  const APP_VERSION = '1.2.0';
   pdfjsLib.GlobalWorkerOptions.workerSrc = 'vendor/pdf.worker.min.js';
 
   const COLORS = ['#d62728', '#1f77b4', '#2ca02c', '#9467bd', '#ff7f0e', '#8c564b', '#e377c2', '#17becf', '#bcbd22', '#7f7f7f', '#393b79', '#e7298a'];
@@ -162,7 +162,17 @@
         else if (hit) {
           gest = { mode: 'drag', hit, id: e.pointerId, sx: e.clientX, sy: e.clientY, orig: hit.arr[hit.idx].slice(), moved: false };
           if (hit.item) { const g0 = gest; g0.lpTimer = setTimeout(() => { if (gest === g0 && !g0.moved) { g0.long = true; setSel({ id: hit.item.id, si: hit.si, idx: hit.idx }); toast('Point selected – tap 🗑 Delete point to remove it'); } }, 450); }
-        } else gest = { mode: 'pending', id: e.pointerId, sx: e.clientX, sy: e.clientY, tx: S.view.tx, ty: S.view.ty, t: Date.now() };
+        } else {
+          gest = { mode: 'pending', id: e.pointerId, sx: e.clientX, sy: e.clientY, tx: S.view.tx, ty: S.view.ty, t: Date.now() };
+          const seg = hitSegment(e.clientX, e.clientY);
+          if (seg) { const g0 = gest; g0.lpTimer = setTimeout(() => {
+            if (gest !== g0 || g0.mode !== 'pending' || ptrs.size !== 1) return;
+            const arr = insertMid(seg);
+            gest = { mode: 'drag', id: g0.id, hit: { kind: 'v', arr, idx: seg.insertAt, item: seg.item, si: seg.si }, moved: true, held: true, sx: g0.sx, sy: g0.sy };
+            if (navigator.vibrate) { try { navigator.vibrate(30); } catch (er) { } }
+            pulse(g0.sx, g0.sy); drawOverlay(); refreshPanelLive(); updateHud();
+          }, 500); }
+        }
       } else if (ptrs.size === 2) {
         if (gest && gest.lpTimer) clearTimeout(gest.lpTimer);
         const [a, b] = [...ptrs.values()];
@@ -183,6 +193,7 @@
         applyView(); scheduleDetail();
       } else if (gest.mode === 'pending' || gest.mode === 'pan') {
         const dx = e.clientX - gest.sx, dy = e.clientY - gest.sy;
+        if (gest.mode === 'pending' && gest.lpTimer && Math.hypot(dx, dy) > 6) { clearTimeout(gest.lpTimer); gest.lpTimer = 0; }
         if (gest.mode === 'pending' && Math.hypot(dx, dy) > (e.pointerType === 'pen' ? 6 : 10)) gest.mode = 'pan';
         if (gest.mode === 'pan') { S.view.tx = gest.tx + dx; S.view.ty = gest.ty + dy; applyView(); scheduleDetail(); }
       } else if (gest.mode === 'mid') {
@@ -193,6 +204,7 @@
         drawOverlay(); refreshPanelLive();
       } else if (gest.mode === 'drag') {
         if (gest.long) return;
+        if (gest.held) { gest.hit.arr[gest.hit.idx] = clampPt(toStage(e.clientX, e.clientY)); drawOverlay(); refreshPanelLive(); e.preventDefault(); return; }
         if (!gest.moved && Math.hypot(e.clientX - gest.sx, e.clientY - gest.sy) < (e.pointerType === 'pen' ? 4 : 8)) return;
         if (!gest.moved) { clearTimeout(gest.lpTimer); if (gest.hit.item) snapshot(gest.hit.item); }
         gest.moved = true;
@@ -211,6 +223,7 @@
       if (gest.mode === 'mid' && e.type === 'pointerup') { const h = gest.hit; insertMid(h); autosave(); renderPanel(); drawOverlay(); toast('Point added – drag it in or out'); }
       if (gest.mode === 'drag') {
         if (gest.long) { /* long-press already selected the point */ }
+        else if (gest.held) { S.selPt = { id: gest.hit.item.id, si: gest.hit.si, idx: gest.hit.idx }; autosave(); renderPanel(); drawOverlay(); updateHud(); }
         else if (!gest.moved) { gest.hit.arr[gest.hit.idx] = gest.orig; if (e.type === 'pointerup') onTap(toStage(e.clientX, e.clientY), e.clientX, e.clientY); }
         else { if (gest.hit.item) S.selPt = { id: gest.hit.item.id, si: gest.hit.si, idx: gest.hit.idx }; autosave(); renderPanel(); drawOverlay(); updateHud(); }
       }
@@ -247,6 +260,30 @@
       if (d < bm) { bm = d; best = { kind: 'm', item: it, si, insertAt: sg[2], pt: m }; }
     }));
     return best;
+  }
+  /* nearest spot on any segment of the selected line (not near a point) within a finger-sized tolerance */
+  function hitSegment(cx, cy) {
+    if (S.tool) return null;
+    const it = activeItem(); if (!it || it.page !== S.pageNum) return null;
+    const p = toStage(cx, cy), tol = 22 / S.view.s; let best = null, bd = tol;
+    it.shapes.forEach((sh, si) => {
+      const pts = sh.pts, segs = [];
+      for (let i = 0; i + 1 < pts.length; i++) segs.push([i, i + 1, i + 1]);
+      if (G.isArea(it.type) && pts.length >= 3) segs.push([pts.length - 1, 0, pts.length]);
+      segs.forEach(sg => {
+        const a = pts[sg[0]], b = pts[sg[1]], dx = b[0] - a[0], dy = b[1] - a[1], L2 = dx * dx + dy * dy;
+        if (!L2) return;
+        const t = Math.max(0, Math.min(1, ((p[0] - a[0]) * dx + (p[1] - a[1]) * dy) / L2));
+        const q = [a[0] + t * dx, a[1] + t * dy], d = G.dist(p, q);
+        if (d < bd) { bd = d; best = { kind: 's', item: it, si, insertAt: sg[2], pt: q }; }
+      });
+    });
+    return best;
+  }
+  function pulse(cx, cy) {
+    const r = $('viewport').getBoundingClientRect(), d = document.createElement('div');
+    d.className = 'pulse'; d.style.left = (cx - r.left) + 'px'; d.style.top = (cy - r.top) + 'px';
+    $('viewport').appendChild(d); setTimeout(() => d.remove(), 700);
   }
   function insertMid(h) {
     snapshot(h.item);
@@ -537,7 +574,7 @@
       '<li><b>📐 Check</b> → tap both ends of another printed dimension. If it matches, you\'re good.</li>' +
       '<li>Tap <b>+ Roof</b> (pick the pitch), <b>+ Walls</b> (pick the floor and wall height), <b>+ Garage Ceiling</b>, etc.</li>' +
       '<li>Tap the corners on the plan. For areas, tap the first point to close it. <b>New section</b> adds another piece to the same line. <b>↶ Undo</b> removes the last point. Drag a white dot to fix it.</li>' +
-      '<li><b>Jogs / bump-outs:</b> tap or drag the <b>+</b> in the middle of a line to add a point, then drag it in or out. To remove a point, press and hold it, then tap <b>🗑 Delete point</b>. Undo works for all of these.</li>' +
+      '<li><b>Jogs / bump-outs:</b> press and hold anywhere on a line (about half a second) until it pulses, then drag without lifting – a new corner follows your finger. Or tap/drag the <b>+</b> in the middle of a line. To remove a point, press and hold it, then tap <b>🗑 Delete point</b>. Undo works for all of these.</li>' +
       '<li><b>⊾ Square</b> keeps lines straight up/down or left/right.</li>' +
       '<li>Tap <b>Done</b> when that line is finished.</li>' +
       '<li><b>💾 Save</b> → Save CSV → Files → Google Drive, so Tess can build the quote.</li>' +
