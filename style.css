@@ -75,3 +75,7 @@ button.danger { background:#c0392b; color:#fff; border-color:#c0392b; }
 @media (max-width: 1300px) { #topbar .apptitle { display:none; } }
 .pulse { position:absolute; width:20px; height:20px; margin:-10px 0 0 -10px; border-radius:50%; border:4px solid #ff3b30; pointer-events:none; animation:pulse .6s ease-out forwards; z-index:5; }
 @keyframes pulse { from { transform:scale(.6); opacity:1; } to { transform:scale(3.2); opacity:0; } }
+#spin { position:fixed; inset:0; background:rgba(0,0,0,.35); z-index:60; display:none; align-items:center; justify-content:center; }
+#spin .spinbox { background:#fff; border-radius:16px; padding:22px 28px; display:flex; flex-direction:column; align-items:center; gap:12px; font-size:18px; font-weight:600; }
+#spin .wheel { width:44px; height:44px; border:5px solid #d6dde4; border-top-color:var(--accent); border-radius:50%; animation:spin .8s linear infinite; }
+@keyframes spin { to { transform:rotate(360deg); } }

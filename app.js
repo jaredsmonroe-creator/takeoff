@@ -3,7 +3,7 @@
   'use strict';
   const G = window.TakeoffGeom;
   const $ = id => document.getElementById(id);
-  const APP_VERSION = '1.2.0';
+  const APP_VERSION = '1.3.0';
   pdfjsLib.GlobalWorkerOptions.workerSrc = 'vendor/pdf.worker.min.js';
 
   const COLORS = ['#d62728', '#1f77b4', '#2ca02c', '#9467bd', '#ff7f0e', '#8c564b', '#e377c2', '#17becf', '#bcbd22', '#7f7f7f', '#393b79', '#e7298a'];
@@ -342,6 +342,69 @@
     autosave(); drawOverlay(); renderPanel();
   }
 
+  /* ---------------- auto trace (vector PDFs only, runs on the iPad) ---------------- */
+  const segCache = {};
+  function spinner(on, msg) {
+    let el = $('spin');
+    if (!el) { el = document.createElement('div'); el.id = 'spin'; el.innerHTML = '<div class="spinbox"><div class="wheel"></div><div id="spinMsg"></div></div>'; document.body.appendChild(el); }
+    el.style.display = on ? 'flex' : 'none'; if (msg) $('spinMsg').textContent = msg;
+  }
+  const NOT_FOUND = "Couldn't find drawn walls on this page; trace by hand.";
+  async function autoTrace(it) {
+    if (!S.pdf || !S.page) return;
+    if (it.page !== S.pageNum) { if (it.shapes.some(s => s.pts.length)) { toast('This line is on page ' + it.page + '. Go to that page or add a new line here.', 3500); return; } it.page = S.pageNum; }
+    const AT = window.TakeoffAuto;
+    const pts = [].concat(...it.shapes.map(s => s.pts));
+    if (pts.length > 1 && !confirm('Replace the points on "' + it.name + '" with the Auto Trace?')) return;
+    spinner(true, 'Finding the walls…');
+    await new Promise(r => setTimeout(r, 40));
+    const t0 = Date.now();
+    try {
+      const page = S.page, pn = S.pageNum;
+      const ck = (S.pdf.fingerprints ? S.pdf.fingerprints[0] : S.proj.pdfName) + '#' + pn;
+      if (!segCache[ck]) { for (const k in segCache) delete segCache[k]; segCache[ck] = await AT.extract(page, pdfjsLib); }
+      const segs = segCache[ck];
+      let sc = scaleOf(pn), readScale = false;
+      if (!sc) {
+        const ts = AT.scaleFromText(await AT.pageText(page));
+        if (!ts) { spinner(false); alert('Set the scale first (📏 Set Scale), then tap Auto Trace again.'); return; }
+        setScale(pn, 1 / ts.ppf, ts.label + ' (read from page)', ts.label + ' read'); sc = scaleOf(pn); readScale = true;
+      }
+      const ppf = 1 / sc.ftPerPt;
+      // where to look: a single tapped point, else the middle of the screen when zoomed in
+      let target = pts.length === 1 ? pts[0] : null;
+      if (!target) {
+        const el = $('viewport'), vw = el.clientWidth / S.view.s, vh = el.clientHeight / S.view.s;
+        if (vw * vh < 0.6 * S.pageW * S.pageH) target = [(el.clientWidth / 2 - S.view.tx) / S.view.s, (el.clientHeight / 2 - S.view.ty) / S.view.s];
+      }
+      const area = G.isArea(it.type);
+      let r = AT.run(segs, S.pageW, S.pageH, { ppf, target });
+      if (r.error && area && it.type !== 'garage_ceiling') r = AT.runSimple(segs, S.pageW, S.pageH, { ppf, target });
+      spinner(false);
+      if (r.error) { alert(r.error === 'toobig' ? 'That drawing is too big to trace at this scale – check the scale, or zoom in on one plan and try again.' : NOT_FOUND); return; }
+      let shapes = [], note = '';
+      const loop = poly => ({ pts: poly.concat([poly[0].slice()]), closed: true, autoPt: true });
+      if (it.type === 'wall') {
+        if (r.hasGarage && r.houseRuns.length) { shapes = r.houseRuns.map(p => ({ pts: p, closed: true })); note = ' Garage walls left out – use + Garage Walls → Auto Trace.'; }
+        else shapes = [loop(r.building)];
+      } else if (it.type === 'garage_wall') {
+        if (!r.hasGarage || !r.garageRuns.length) { alert('No garage found on this page; trace the garage walls by hand.'); return; }
+        shapes = r.garageRuns.map(p => ({ pts: p, closed: true }));
+      } else if (it.type === 'garage_ceiling') {
+        if (!r.garage) { alert('No garage found on this page; trace it by hand.'); return; }
+        shapes = [{ pts: r.garage, closed: true }];
+      } else if (area) shapes = [{ pts: r.building, closed: true }];
+      else shapes = [loop(r.building)];
+      snapshot(it);
+      it.shapes = shapes; S.selPt = null;
+      autosave(); drawOverlay(); renderPanel(); updateHud();
+      const c = calc(it);
+      const what = area ? Math.round(c.flat).toLocaleString() + ' sf (flat)' : c.lf.toFixed(1) + ' LF';
+      toast('✨ Found ' + what + ' in ' + ((Date.now() - t0) / 1000).toFixed(1) + 's. Check it and drag points to fix.' + note + (readScale ? ' Scale ' + sc.short + ' was read from the page – verify with 📐 Check.' : ''), 7000);
+      window.__lastTrace = r;
+    } catch (e) { console.error(e); spinner(false); alert(NOT_FOUND + '\n(' + e.message + ')'); }
+  }
+
   /* ---------------- items ---------------- */
   function addItem(type) {
     if (!S.pdf) { toast('Open a plan first'); return; }
@@ -575,6 +638,7 @@
       '<li>Tap <b>+ Roof</b> (pick the pitch), <b>+ Walls</b> (pick the floor and wall height), <b>+ Garage Ceiling</b>, etc.</li>' +
       '<li>Tap the corners on the plan. For areas, tap the first point to close it. <b>New section</b> adds another piece to the same line. <b>↶ Undo</b> removes the last point. Drag a white dot to fix it.</li>' +
       '<li><b>Jogs / bump-outs:</b> press and hold anywhere on a line (about half a second) until it pulses, then drag without lifting – a new corner follows your finger. Or tap/drag the <b>+</b> in the middle of a line. To remove a point, press and hold it, then tap <b>🗑 Delete point</b>. Undo works for all of these.</li>' +
+      '<li><b>✨ Auto Trace</b> (vector PDFs): add a line (Walls, Roof, Garage…) and tap <b>Auto Trace this page</b> – it draws the outside of the walls for you. Sheet with several plans? Zoom in on the one you want, or tap one spot inside it first. Always check it and fix points; Undo puts it back.</li>' +
       '<li><b>⊾ Square</b> keeps lines straight up/down or left/right.</li>' +
       '<li>Tap <b>Done</b> when that line is finished.</li>' +
       '<li><b>💾 Save</b> → Save CSV → Files → Google Drive, so Tess can build the quote.</li>' +
@@ -614,11 +678,12 @@
     if (it.type === 'roof') h += '<div class="row"><label>Pitch</label><select id="edPitch">' + pitchOptions(it.pitch) + '</select><span class="sub">× ' + G.pitchFactor(it.pitch).toFixed(3) + '</span></div>';
     if (G.isLength(it.type)) {
       h += '<div class="row"><label>Floor</label><select id="edFloor">' + floorOptions(it.floor) + '</select>';
-      h += '<label>Height</label><input id="edHeight" class="short" value="' + esc(G.fmtFtIn(+it.height, 4).replace(' 0"', '"')) + '" inputmode="text"></div>';
+      h += '<label>Height</label><input id="edHeight" class="short" value="' + esc(G.fmtFtIn(+it.height, 4).replace(/ 0"$/, '')) + '" inputmode="text"></div>';
     }
     h += '<div class="row"><label>Qty ×</label><input id="edQty" class="short" inputmode="decimal" value="' + esc(it.qty) + '">';
     h += '<label>' + (G.isLength(it.type) ? 'Deduct/add sf' : 'Add/deduct sf') + '</label><input id="edAdj" class="short" inputmode="numbers-and-punctuation" value="' + esc(it.adjust || 0) + '"></div>';
     h += '<div class="row"><span class="big" id="edSF">' + fmtSF(c.sf) + '</span><span class="sub" id="edSub">' + subText(it, c) + '</span></div>';
+    h += '<button id="edAuto" class="primary" style="width:100%;margin-top:8px">✨ Auto Trace this page</button>';
     h += '<div class="btns"><button id="edUndo">↶ Undo</button><button id="edSec">' + (area ? '＋ New section' : '＋ New run') + '</button><button id="edDone" class="okc">✓ Done</button></div>';
     h += '<div class="btns"><button id="edDelPt"' + (validSel() ? '' : ' disabled style="opacity:.45"') + '>🗑 Delete point</button><span></span><button id="edDel" class="danger">Delete line</button></div>';
     h += '</div>';
@@ -636,6 +701,7 @@
     $('edQty').onchange = e => { const v = parseFloat(e.target.value); it.qty = isNaN(v) ? 1 : v; changed(); };
     $('edAdj').onchange = e => { const v = parseFloat(e.target.value); it.adjust = isNaN(v) ? 0 : v; changed(); };
     $('edUndo').onclick = undoPoint; $('edSec').onclick = newSection;
+    $('edAuto').onclick = () => autoTrace(it);
     $('edDone').onclick = () => { const sh = it.shapes[it.shapes.length - 1]; if (sh) sh.closed = true; S.activeId = null; S.selPt = null; updateHud(); autosave(); renderPanel(); drawOverlay(); };
     $('edDel').onclick = () => deleteItem(it.id);
     $('edDelPt').onclick = deletePoint;
@@ -644,7 +710,7 @@
     if (c.noScale) return 'set the scale to see sf';
     const n = it.shapes.filter(s => s.pts.length).length;
     if (G.isArea(it.type)) return 'flat ' + Math.round(c.flat).toLocaleString() + ' sf' + (it.type === 'roof' ? ' · ' + (it.pitch || 0) + '/12' : '') + ' · ' + n + ' section' + (n === 1 ? '' : 's');
-    return c.lf.toFixed(1) + ' LF × ' + G.fmtFtIn(+it.height, 4).replace(' 0"', '"') + ' · ' + n + ' run' + (n === 1 ? '' : 's');
+    return c.lf.toFixed(1) + ' LF × ' + G.fmtFtIn(+it.height, 4).replace(/ 0"$/, '') + ' · ' + n + ' run' + (n === 1 ? '' : 's');
   }
   function changed() { autosave(); renderPanel(); drawOverlay(); }
   function refreshPanelLive() { const it = activeItem(); if (!it || !$('edSF')) return; const c = calc(it); $('edSF').textContent = fmtSF(c.sf); $('edSub').textContent = subText(it, c); }
@@ -658,7 +724,7 @@
       if (c.sf !== null) { tot[it.type] = (tot[it.type] || 0) + c.sf; grand += c.sf; } else if (it.shapes.length) missing++;
       let det = G.TYPE_LABELS[it.type] + ' · p' + it.page;
       if (it.type === 'roof') det += ' · ' + (it.pitch || 0) + '/12';
-      if (G.isLength(it.type)) det += ' · ' + (c.lf === null ? '—' : c.lf.toFixed(1)) + ' LF × ' + G.fmtFtIn(+it.height).replace(' 0"', '"');
+      if (G.isLength(it.type)) det += ' · ' + (c.lf === null ? '—' : c.lf.toFixed(1)) + ' LF × ' + G.fmtFtIn(+it.height).replace(/ 0"$/, '');
       else if (c.flat !== null) det += ' · flat ' + Math.round(c.flat);
       return '<div class="item' + (it.id === S.activeId ? ' active' : '') + '" data-id="' + it.id + '"><span class="sw" style="background:' + it.color + '"></span><span class="nm"><b>' + esc(it.name) + '</b><small>' + esc(det) + '</small></span><span class="val">' + fmtSF(c.sf) + '</span></div>';
     }).join('');
@@ -723,7 +789,7 @@
 
   // test hook: lets an automated test load a PDF from a URL
   window.__openPdfUrl = async (url, name) => { const r = await fetch(url); await openPdfBytes(await r.arrayBuffer(), name || url.split('/').pop()); };
-  window.__api = { addItem, onTap, setScale, showPage, startTool, finishTool, askCalibrationLength, fitView, G };
+  window.__api = { autoTrace, addItem, onTap, setScale, showPage, startTool, finishTool, askCalibrationLength, fitView, G };
 
   wire(); initGestures(); restore();
   if ('serviceWorker' in navigator && (location.protocol === 'https:' || location.hostname === 'localhost')) navigator.serviceWorker.register('sw.js').catch(() => { });
