@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Takeoff">
+<meta name="theme-color" content="#1f3b57">
+<title>Epic Takeoff</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="apple-touch-icon" href="icons/icon-180.png">
+<link rel="icon" href="icons/icon-192.png">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header id="topbar">
+  <button id="btnOpen" class="primary">📄 Open Plan</button>
+  <div class="grp">
+    <button id="btnPrev" aria-label="Previous page">◀</button>
+    <button id="btnPage" class="pagebtn">Page –</button>
+    <button id="btnNext" aria-label="Next page">▶</button>
+  </div>
+  <button id="btnScale" class="warn">📏 Set Scale</button>
+  <button id="btnRuler" class="toggle">📐 Check</button>
+  <button id="btnOrtho" class="toggle">⊾ Square</button>
+  <button id="btnFit">⤢ Fit</button>
+  <span class="spacer"></span>
+  <button id="btnPanel">☰ List</button>
+  <button id="btnMenu">💾 Save</button>
+  <input type="file" id="filePdf" accept="application/pdf,.pdf" hidden>
+  <input type="file" id="fileJson" accept=".json,application/json,text/plain" hidden>
+</header>
+
+<main id="main">
+  <div id="viewport">
+    <div id="stage">
+      <canvas id="pageCanvas"></canvas>
+      <div id="detailHolder"></div>
+      <svg id="overlay" xmlns="http://www.w3.org/2000/svg"></svg>
+    </div>
+    <div id="empty">
+      <h2>Epic Takeoff</h2>
+      <ol>
+        <li>Tap <b>📄 Open Plan</b> and pick the PDF (Files or Google Drive).</li>
+        <li>Pick the page, then tap <b>📏 Set Scale</b>.</li>
+        <li>Tap <b>📐 Check</b> and measure a printed dimension to verify the scale.</li>
+        <li>Tap a <b>+</b> button (Roof, Walls, Garage…) and tap the corners on the plan.</li>
+        <li>Tap <b>💾 Save</b> to send the CSV to Files / Google Drive for Tess.</li>
+      </ol>
+      <p class="hint">One finger drag = move the plan. Two fingers = zoom. Quick tap = place a point.</p>
+    </div>
+    <div id="hud"></div>
+    <div id="toast"></div>
+  </div>
+
+  <aside id="panel">
+    <div id="editor"></div>
+    <div class="addgrid">
+      <button data-add="roof" class="add c-roof">+ Roof</button>
+      <button data-add="wall" class="add c-wall">+ Walls</button>
+      <button data-add="gable" class="add c-gable">+ Gable</button>
+      <button data-add="bsmt_ceiling" class="add c-bsmt">+ Bsmt Ceiling</button>
+      <button data-add="bsmt_wall" class="add c-bsmt">+ Bsmt Walls</button>
+      <button data-add="garage_ceiling" class="add c-gar">+ Garage Ceiling</button>
+      <button data-add="garage_wall" class="add c-gar">+ Garage Walls</button>
+      <button data-add="other_area" class="add c-oth">+ Other Area</button>
+      <button data-add="other_wall" class="add c-oth">+ Other Walls</button>
+    </div>
+    <div class="jobrow"><label>Job <input id="jobName" placeholder="Customer / job name"></label></div>
+    <div id="list"></div>
+    <div id="totals"></div>
+  </aside>
+</main>
+
+<div id="modal" class="hidden"><div class="modalbox" id="modalbox"></div></div>
+
+<script src="vendor/pdf.min.js"></script>
+<script src="geom.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
