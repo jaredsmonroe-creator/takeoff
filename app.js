@@ -3,7 +3,7 @@
   'use strict';
   const G = window.TakeoffGeom;
   const $ = id => document.getElementById(id);
-  const APP_VERSION = '1.3.0';
+  const APP_VERSION = '1.4.0';
   pdfjsLib.GlobalWorkerOptions.workerSrc = 'vendor/pdf.worker.min.js';
 
   const COLORS = ['#d62728', '#1f77b4', '#2ca02c', '#9467bd', '#ff7f0e', '#8c564b', '#e377c2', '#17becf', '#bcbd22', '#7f7f7f', '#393b79', '#e7298a'];
@@ -50,7 +50,8 @@
   async function openPdfBytes(buf, name, keepProject) {
     const bytes = new Uint8Array(buf);
     try { await idbPut('pdf', { name, bytes: bytes.slice() }); } catch (e) { console.warn('could not store pdf', e); }
-    if (S.pdf) { try { S.pdf.destroy(); } catch (e) { } }
+    clearDetail(); if (S.renderTask) { try { S.renderTask.cancel(); } catch (e) { } }
+    if (S.pdf) { const old = S.pdf; S.page = null; S.pdf = null; try { await old.destroy(); } catch (e) { } }
     S.pdf = await pdfjsLib.getDocument({ data: bytes, cMapUrl: 'vendor/cmaps/', cMapPacked: true, standardFontDataUrl: 'vendor/standard_fonts/', isEvalSupported: false }).promise;
     S.pageCount = S.pdf.numPages;
     if (!keepProject) {
@@ -101,6 +102,9 @@
   function clearDetail() { clearTimeout(S.detailTimer); if (S.detailTask) { try { S.detailTask.cancel(); } catch (e) { } S.detailTask = null; } $('detailHolder').innerHTML = ''; }
   function scheduleDetail() { clearTimeout(S.detailTimer); S.detailTimer = setTimeout(renderDetail, 280); }
   async function renderDetail() {
+    try { await renderDetail2(); } catch (e) { /* page was closed while rendering */ }
+  }
+  async function renderDetail2() {
     if (!S.page || S.renderTask) return;
     const dpr = Math.min(window.devicePixelRatio || 1, 3);
     const R = Math.min(S.view.s * dpr, 12);
@@ -362,8 +366,8 @@
     try {
       const page = S.page, pn = S.pageNum;
       const ck = (S.pdf.fingerprints ? S.pdf.fingerprints[0] : S.proj.pdfName) + '#' + pn;
-      if (!segCache[ck]) { for (const k in segCache) delete segCache[k]; segCache[ck] = await AT.extract(page, pdfjsLib); }
-      const segs = segCache[ck];
+      if (!segCache[ck]) { for (const k in segCache) delete segCache[k]; segCache[ck] = { segs: await AT.extract(page, pdfjsLib), text: await AT.textItems(page, pdfjsLib) }; }
+      const segs = segCache[ck].segs, text = segCache[ck].text;
       let sc = scaleOf(pn), readScale = false;
       if (!sc) {
         const ts = AT.scaleFromText(await AT.pageText(page));
@@ -378,31 +382,40 @@
         if (vw * vh < 0.6 * S.pageW * S.pageH) target = [(el.clientWidth / 2 - S.view.tx) / S.view.s, (el.clientHeight / 2 - S.view.ty) / S.view.s];
       }
       const area = G.isArea(it.type);
-      let r = AT.run(segs, S.pageW, S.pageH, { ppf, target });
+      let r = AT.run(segs, S.pageW, S.pageH, { ppf, target, text });
       if (r.error && area && it.type !== 'garage_ceiling') r = AT.runSimple(segs, S.pageW, S.pageH, { ppf, target });
       spinner(false);
       if (r.error) { alert(r.error === 'toobig' ? 'That drawing is too big to trace at this scale – check the scale, or zoom in on one plan and try again.' : NOT_FOUND); return; }
       let shapes = [], note = '';
       const loop = poly => ({ pts: poly.concat([poly[0].slice()]), closed: true, autoPt: true });
-      if (it.type === 'wall') {
-        if (r.hasGarage && r.houseRuns.length) { shapes = r.houseRuns.map(p => ({ pts: p, closed: true })); note = ' Garage walls left out – use + Garage Walls → Auto Trace.'; }
-        else shapes = [loop(r.building)];
-      } else if (it.type === 'garage_wall') {
-        if (!r.hasGarage || !r.garageRuns.length) { alert('No garage found on this page; trace the garage walls by hand.'); return; }
-        shapes = r.garageRuns.map(p => ({ pts: p, closed: true }));
-      } else if (it.type === 'garage_ceiling') {
-        if (!r.garage) { alert('No garage found on this page; trace it by hand.'); return; }
-        shapes = [{ pts: r.garage, closed: true }];
-      } else if (area) shapes = [{ pts: r.building, closed: true }];
+      // every wall type: ONE closed loop around the outside face of the exterior walls (garage included)
+      if (it.type === 'garage_ceiling' && r.garage) shapes = [{ pts: r.garage, closed: true }];
+      else if (area) { shapes = [{ pts: r.building, closed: true }]; if (it.type === 'garage_ceiling') note = ' No separate garage found – this is the whole building outline; move points to the garage.'; }
       else shapes = [loop(r.building)];
       snapshot(it);
       it.shapes = shapes; S.selPt = null;
       autosave(); drawOverlay(); renderPanel(); updateHud();
       const c = calc(it);
-      const what = area ? Math.round(c.flat).toLocaleString() + ' sf (flat)' : c.lf.toFixed(1) + ' LF';
-      toast('✨ Found ' + what + ' in ' + ((Date.now() - t0) / 1000).toFixed(1) + 's. Check it and drag points to fix.' + note + (readScale ? ' Scale ' + sc.short + ' was read from the page – verify with 📐 Check.' : ''), 7000);
+      const what = area ? Math.round(c.flat).toLocaleString() + ' sf' : c.lf.toFixed(1) + ' LF';
+      zoomToPts(shapes[0].pts);
+      const small = Math.max(S.pageW, S.pageH) < 0.9 * 72 * 36 && readScale;
+      traceBanner('✨ Auto Trace: <b>' + what + '</b>' + (area ? ' (flat)' : ' outside of walls') + ' — check the outline on the plan.' + esc(note) +
+        (readScale ? '<br>Scale ' + esc(String(sc.short).replace(/\s*read$/, '')) + ' was read from the page' + (small ? ' – this sheet looks REDUCED, calibrate!' : ' – verify with 📐 Check.') : ''));
       window.__lastTrace = r;
     } catch (e) { console.error(e); spinner(false); alert(NOT_FOUND + '\n(' + e.message + ')'); }
+  }
+
+  function zoomToPts(pts) {
+    if (!pts || !pts.length) return;
+    let x0 = 1e9, y0 = 1e9, x1 = -1e9, y1 = -1e9; pts.forEach(p => { x0 = Math.min(x0, p[0]); y0 = Math.min(y0, p[1]); x1 = Math.max(x1, p[0]); y1 = Math.max(y1, p[1]); });
+    const el = $('viewport'), W = el.clientWidth, H = el.clientHeight, w = Math.max(20, x1 - x0), h = Math.max(20, y1 - y0);
+    const s = Math.min(W / w, (H - 90) / h) * 0.85; S.view = { s, tx: W / 2 - (x0 + w / 2) * s, ty: 90 + (H - 90) / 2 - (y0 + h / 2) * s };
+    applyView(); scheduleDetail();
+  }
+  function traceBanner(html) {
+    const h = $('hud'); h.innerHTML = '<div id="traceBanner">' + html + ' <button id="tbOk" class="okc">OK</button></div>';
+    $('tbOk').onclick = () => { h.innerHTML = ''; updateHud(); };
+    clearTimeout(traceBanner._t); traceBanner._t = setTimeout(() => { if ($('traceBanner')) { h.innerHTML = ''; updateHud(); } }, 12000);
   }
 
   /* ---------------- items ---------------- */
@@ -638,7 +651,7 @@
       '<li>Tap <b>+ Roof</b> (pick the pitch), <b>+ Walls</b> (pick the floor and wall height), <b>+ Garage Ceiling</b>, etc.</li>' +
       '<li>Tap the corners on the plan. For areas, tap the first point to close it. <b>New section</b> adds another piece to the same line. <b>↶ Undo</b> removes the last point. Drag a white dot to fix it.</li>' +
       '<li><b>Jogs / bump-outs:</b> press and hold anywhere on a line (about half a second) until it pulses, then drag without lifting – a new corner follows your finger. Or tap/drag the <b>+</b> in the middle of a line. To remove a point, press and hold it, then tap <b>🗑 Delete point</b>. Undo works for all of these.</li>' +
-      '<li><b>✨ Auto Trace</b> (vector PDFs): add a line (Walls, Roof, Garage…) and tap <b>Auto Trace this page</b> – it draws the outside of the walls for you. Sheet with several plans? Zoom in on the one you want, or tap one spot inside it first. Always check it and fix points; Undo puts it back.</li>' +
+      '<li><b>✨ Auto Trace</b> (CAD/vector PDFs, not scans): add a line (Walls, Roof, Garage…) and tap <b>Auto Trace this page</b>. It draws ONE loop around the outside of the exterior walls – garage included – and zooms to it with the LF shown at the top. Move points to take out the garage or porches. Sheet with several plans? Zoom in on the one you want, or tap one spot inside it first. It skips schedules, notes and the title block. Shrunk printouts (11×17): calibrate the scale first. Undo puts it back.</li>' +
       '<li><b>⊾ Square</b> keeps lines straight up/down or left/right.</li>' +
       '<li>Tap <b>Done</b> when that line is finished.</li>' +
       '<li><b>💾 Save</b> → Save CSV → Files → Google Drive, so Tess can build the quote.</li>' +
@@ -789,7 +802,7 @@
 
   // test hook: lets an automated test load a PDF from a URL
   window.__openPdfUrl = async (url, name) => { const r = await fetch(url); await openPdfBytes(await r.arrayBuffer(), name || url.split('/').pop()); };
-  window.__api = { autoTrace, addItem, onTap, setScale, showPage, startTool, finishTool, askCalibrationLength, fitView, G };
+  window.__api = { zoomToPts, autoTrace, addItem, onTap, setScale, showPage, startTool, finishTool, askCalibrationLength, fitView, G };
 
   wire(); initGestures(); restore();
   if ('serviceWorker' in navigator && (location.protocol === 'https:' || location.hostname === 'localhost')) navigator.serviceWorker.register('sw.js').catch(() => { });

@@ -10,19 +10,22 @@
     const OPS = pdfjsLib.OPS, ol = await page.getOperatorList();
     const vp = page.getViewport({ scale: 1 }), VT = vp.transform;
     const mul = (m, n) => [m[0] * n[0] + m[2] * n[1], m[1] * n[0] + m[3] * n[1], m[0] * n[2] + m[2] * n[3], m[1] * n[2] + m[3] * n[3], m[0] * n[4] + m[2] * n[5] + m[4], m[1] * n[4] + m[3] * n[5] + m[5]];
-    let ctm = [1, 0, 0, 1, 0, 0], lw = 1; const stack = [];
+    let ctm = [1, 0, 0, 1, 0, 0], lw = 1, sc = [0, 0], fc = [0, 0]; const stack = [];
+    const col = a => { const r = +a[0], g = +a[1], b = +a[2]; return [(0.299 * r + 0.587 * g + 0.114 * b) / 255, Math.max(r, g, b) - Math.min(r, g, b) > 40 ? 1 : 0]; };
     const segs = []; let path = [];
     const STROKE = new Set([OPS.stroke, OPS.closeStroke, OPS.fillStroke, OPS.eoFillStroke, OPS.closeFillStroke, OPS.closeEOFillStroke]);
     const PAINT = new Set([...STROKE, OPS.fill, OPS.eoFill, OPS.endPath]);
     for (let i = 0; i < ol.fnArray.length; i++) {
       const fn = ol.fnArray[i], a = ol.argsArray[i];
-      if (fn === OPS.save) stack.push([ctm, lw]);
-      else if (fn === OPS.restore) { const s = stack.pop(); if (s) { ctm = s[0]; lw = s[1]; } }
+      if (fn === OPS.save) stack.push([ctm, lw, sc, fc]);
+      else if (fn === OPS.restore) { const s = stack.pop(); if (s) { ctm = s[0]; lw = s[1]; sc = s[2]; fc = s[3]; } }
+      else if (fn === OPS.setStrokeRGBColor) sc = col(a);
+      else if (fn === OPS.setFillRGBColor) fc = col(a);
       else if (fn === OPS.transform) ctm = mul(ctm, a);
       else if (fn === OPS.setLineWidth) lw = a[0];
       else if (fn === OPS.setGState) { (a[0] || []).forEach(kv => { if (kv[0] === 'LW') lw = kv[1]; }); }
-      else if (fn === OPS.paintFormXObjectBegin) { stack.push([ctm, lw]); if (a[0]) ctm = mul(ctm, a[0]); }
-      else if (fn === OPS.paintFormXObjectEnd) { const s = stack.pop(); if (s) { ctm = s[0]; lw = s[1]; } }
+      else if (fn === OPS.paintFormXObjectBegin) { stack.push([ctm, lw, sc, fc]); if (a[0]) ctm = mul(ctm, a[0]); }
+      else if (fn === OPS.paintFormXObjectEnd) { const s = stack.pop(); if (s) { ctm = s[0]; lw = s[1]; sc = s[2]; fc = s[3]; } }
       else if (fn === OPS.constructPath) {
         const ops = a[0], co = a[1]; let k = 0, cx = 0, cy = 0, sx = 0, sy = 0;
         const M = mul(VT, ctm), T = (x, y) => [M[0] * x + M[2] * y + M[4], M[1] * x + M[3] * y + M[5]];
@@ -42,13 +45,20 @@
         path._w = lw * Math.sqrt(Math.abs(M[0] * M[3] - M[1] * M[2]));
       }
       if (PAINT.has(fn)) {
-        if (STROKE.has(fn) && path.length) { const w = Math.round((path._w || 0) * 100) / 100; for (const s of path) segs.push([s[0][0], s[0][1], s[1][0], s[1][1], w]); }
+        if (STROKE.has(fn) && path.length) { const w = Math.round((path._w || 0) * 100) / 100; for (const s of path) segs.push([s[0][0], s[0][1], s[1][0], s[1][1], w, sc[0], 0, sc[1]]); }
+        else if ((fn === OPS.fill || fn === OPS.eoFill) && path.length && fc[0] < 0.6 && !fc[1]) { for (const s of path) segs.push([s[0][0], s[0][1], s[1][0], s[1][1], -1, fc[0], 1, 0]); } // dark wall poché
         path = [];
       }
     }
     return segs;
   };
   AT.pageText = async function (page) { const tc = await page.getTextContent(); return tc.items.map(t => t.str).join(' '); };
+  /* text positions (page coords) – used to skip schedules / notes / title blocks */
+  AT.textItems = async function (page, pdfjsLib) {
+    const tc = await page.getTextContent(), VT = page.getViewport({ scale: 1 }).transform, out = [];
+    for (const t of tc.items) { if (!t.str || !t.str.trim()) continue; const m = pdfjsLib.Util.transform(VT, t.transform); out.push([m[4], m[5], t.str.trim().length]); }
+    return out;
+  };
   /* points-per-foot from a printed note like 1/4" = 1'-0" (most common one on the page) */
   AT.scaleFromText = function (txt) {
     const re = /(\d+)\s*\/\s*(\d+)\s*(?:"|”|''|IN\.?)\s*(?:=|[-–]{1,3})\s*1\s*(?:'|’|FT)/g; const cnt = {}; let m;
@@ -64,7 +74,9 @@
   function linesByWeight(segs, W, H) {
     const thr = 0.006 * Math.max(W, H), g = new Map();
     for (const s of segs) {
-      const [x1, y1, x2, y2, w] = s;
+      const [x1, y1, x2, y2, w0, lum, fill, colored] = s;
+      if (colored || (!fill && lum > 0.45)) continue; // grey grid lines, orange/red dimensions
+      const w = fill ? 'F' : w0;
       if ((Math.abs(x1 - x2) < 0.3 || Math.abs(y1 - y2) < 0.3) && Math.hypot(x2 - x1, y2 - y1) > thr) { if (!g.has(w)) g.set(w, []); g.get(w).push(s); }
     }
     return g;
@@ -73,9 +85,9 @@
   function pickWalls(segs, W, H) {
     const out = [];
     for (const [w, ls] of linesByWeight(segs, W, H)) {
-      if (ls.length < 20) continue;
+      if (ls.length < 12) continue;
       const ls2 = ls.filter(s => Math.hypot(s[2] - s[0], s[3] - s[1]) < 0.6 * Math.min(W, H));
-      if (ls2.length < 20) continue;
+      if (ls2.length < 12) continue;
       const bb = bbox(ls2); if (bb[2] - bb[0] > 0.9 * W && bb[3] - bb[1] > 0.9 * H) continue;
       out.push([w, ls2, bb]);
     }
@@ -99,19 +111,46 @@
     let peak = null, pv = -1; for (const [k, v] of hist) if (v > pv) { pv = v; peak = k; }
     return [tot ? paired / tot : 0, peak, tot];
   }
-  AT.chooseWalls = function (segs, W, H) {
-    const long_ = Math.max(W, H), good = [];
-    for (const [w, ls] of pickWalls(segs, W, H)) {
-      if (ls.length < 30 || w === 0) continue;
+  /* wall lines: the THICKEST dark line weight (or dark filled wall poché) drawn as parallel pairs with enough length.
+     Thin lines (tables, schedules, notes, grids, dimensions) only win when nothing thicker qualifies. */
+  AT.chooseWalls = function (segs, W, H, ppf, keep) {
+    const long_ = Math.max(W, H), good = [], minLen = ppf ? 60 * ppf : 0.3 * long_;
+    for (const [w, ls0] of pickWalls(segs, W, H)) {
+      const ls = keep ? ls0.filter(keep) : ls0;
+      if (ls.length < (w === 'F' ? 12 : 30) || w === 0) continue;
       const [pf, peak, tot] = pairInfo(ls, long_);
-      if (pf >= 0.35 && pf <= 1 && peak) good.push([tot, w, ls, peak]);
+      if (pf >= 0.35 && pf <= 1 && peak && tot >= minLen) good.push([tot, w, ls, peak]);
     }
     if (!good.length) return null;
-    good.sort((a, b) => b[0] - a[0]);
-    const [tot, w, ls0, peak] = good[0]; let ls = ls0.slice();
-    for (const g of good.slice(1)) if (Math.abs(g[3] - peak) <= 0.25 * peak && g[0] > 0.5 * tot) ls = ls.concat(g[2]);
-    return { w, ls, bb: bbox(ls) };
+    const thick = g => (g[1] === 'F' ? 1e3 : g[1]);
+    good.sort((a, b) => thick(b) - thick(a) || b[0] - a[0]);
+    const cands = good.map(g => g[1] + ':' + Math.round(g[0] / (ppf || 1)));
+    // one option per weight, thickest first; each also takes the other weights drawn at the same wall spacing
+    return good.map((g0, i) => {
+      const [tot, w, ls0, peak] = g0; let ls = ls0.slice();
+      good.forEach((g, j) => { if (j !== i && Math.abs(g[3] - peak) <= 0.35 * peak && g[0] > 0.3 * tot) ls = ls.concat(g[2]); });
+      return { w, ls, bb: bbox(ls), cands };
+    });
   };
+  /* title block / sheet-border strips: long dark border lines near any edge of the sheet (works for rotated sheets too).
+     Returns the box that still holds the drawing [x0, y0, x1, y1]. */
+  AT.titleBox = function (segs, W, H) {
+    let x0 = 0, y0 = 0, x1 = W, y1 = H;
+    for (const s of segs) {
+      if (s[6] || s[7] || s[5] > 0.45) continue;
+      if (Math.abs(s[0] - s[2]) < 0.5 && Math.abs(s[3] - s[1]) > 0.6 * H) {
+        const x = s[0];
+        if (x > 0.8 * W && x < 0.985 * W && x < x1) x1 = x;
+        if (x < 0.2 * W && x > 0.015 * W && x > x0) x0 = x;
+      } else if (Math.abs(s[1] - s[3]) < 0.5 && Math.abs(s[2] - s[0]) > 0.6 * W) {
+        const y = s[1];
+        if (y > 0.8 * H && y < 0.985 * H && y < y1) y1 = y;
+        if (y < 0.2 * H && y > 0.015 * H && y > y0) y0 = y;
+      }
+    }
+    return [x0, y0, x1, y1];
+  };
+  AT.titleCut = function (segs, W, H) { return AT.titleBox(segs, W, H)[2]; };
   /* separate drawings on one sheet by empty bands */
   AT.split = function (ls, gap) {
     const split1 = (ls, ax) => {
@@ -189,7 +228,7 @@
       if (i0 > i1) [i0, i1] = [i1, i0]; if (j0 > j1) [j0, j1] = [j1, j0];
       for (let j = j0; j <= j1; j++) for (let i = i0; i <= i1; i++) g[j * W + i] = 1;
     }
-    const house = insideMask(g, W, H, Math.round(3 / cell));
+    const house = insideMask(g, W, H, Math.round((opt.closeFt || 3) / cell));
     const hc = largest(components(house, W, H));
     const hs = new Uint8Array(W * H); hc.forEach(p => hs[p] = 1);
     const big = insideMask(g, W, H, Math.round(9.5 / cell));
@@ -372,8 +411,8 @@
   }
   /* fallback for area lines when no wall pairs exist (e.g. a roof plan): try each heavy line weight */
   AT.runSimple = function (segs, W, H, opts) {
-    const long_ = Math.max(W, H), thr = 0.006 * long_, ppf = opts.ppf, byW = new Map();
-    for (const s of segs) { const L = Math.hypot(s[2] - s[0], s[3] - s[1]); if (L > thr && L < 0.6 * Math.min(W, H) && s[4] > 0) { if (!byW.has(s[4])) byW.set(s[4], []); byW.get(s[4]).push(s); } }
+    const long_ = Math.max(W, H), thr = 0.006 * long_, ppf = opts.ppf, byW = new Map(), tb = AT.titleBox(segs, W, H);
+    for (const s of segs) { const L = Math.hypot(s[2] - s[0], s[3] - s[1]); if (Math.min(s[0], s[2]) > tb[0] + 2 && Math.max(s[0], s[2]) < tb[2] - 2 && Math.min(s[1], s[3]) > tb[1] + 2 && Math.max(s[1], s[3]) < tb[3] - 2 && !s[6] && !s[7] && L > thr && L < 0.6 * Math.min(W, H) && s[4] > 0) { if (!byW.has(s[4])) byW.set(s[4], []); byW.get(s[4]).push(s); } }
     let best = null;
     for (const [w, ls0] of byW) {
       if (ls0.length < 8) continue;
@@ -395,23 +434,37 @@
 
   /* ---------- 5. one call for the app ---------- */
   // opts: {ppf, target:[x,y]|null}
+  // opts: {ppf, target:[x,y]|null, text:[[x,y,nChars]]}
   AT.run = function (segs, W, H, opts) {
-    const sel = AT.chooseWalls(segs, W, H);
-    if (!sel) return { error: 'nowalls' };
-    let ls = sel.ls; const parts = AT.split(ls, 0.02 * Math.max(W, H));
-    if (parts.length > 1) {
-      const t = opts.target;
-      if (t) {
-        const sc = parts.map(p => { const b = bbox(p); const dx = Math.max(b[0] - t[0], 0, t[0] - b[2]), dy = Math.max(b[1] - t[1], 0, t[1] - b[3]); return [Math.hypot(dx, dy), (b[2] - b[0]) * (b[3] - b[1]), p]; });
-        sc.sort((a, b) => a[0] - b[0] || a[1] - b[1]); ls = sc[0][2];
-      } else ls = parts.reduce((a, b) => (b.length > a.length ? b : a));
-    }
-    const r = AT.analyze(ls, opts.ppf);
-    if (r.error) return { error: r.error === 'too big' ? 'toobig' : 'nowalls' };
-    if (r.footprint < 150) return { error: 'nowalls' };
-    r.weight = sel.w; r.nlines = ls.length; r.parts = parts.length;
-    return r;
+    const tb = AT.titleBox(segs, W, H), cut = tb[2];
+    const keep = s => Math.min(s[0], s[2]) > tb[0] + 2 && Math.max(s[0], s[2]) < tb[2] - 2 && Math.min(s[1], s[3]) > tb[1] + 2 && Math.max(s[1], s[3]) < tb[3] - 2;
+    const opts2 = AT.chooseWalls(segs, W, H, opts.ppf, keep);
+    if (!opts2) return { error: 'nowalls' };
+    for (const sel of opts2.slice(0, 5)) { const r = tryWalls(sel, W, H, opts); if (r) { r.weight = sel.w; r.cands = sel.cands; r.titleCut = cut; return r; } }
+    return { error: 'nowalls' };
   };
+  function tryWalls(sel, W, H, opts) {
+    // separate drawings sit far apart; wide window/door openings inside one building must not split it
+    let parts = AT.split(sel.ls, Math.max(0.02 * Math.max(W, H), 8 * opts.ppf)).filter(p => p.length >= 12);
+    if (!parts.length) return null;
+    // drop schedules / notes: boxes packed with text (characters per square inch of paper); drop sheet-size frames
+    const text = opts.text || [];
+    const dens = p => { const b = bbox(p), a = Math.max(1, (b[2] - b[0]) * (b[3] - b[1]) / 5184); let n = 0; for (const t of text) if (t[0] >= b[0] && t[0] <= b[2] && t[1] >= b[1] && t[1] <= b[3]) n += t[2]; return n / a; };
+    let cands = parts.map(p => ({ p, d: dens(p), b: bbox(p) })).filter(x => x.d < 60 && !((x.b[2] - x.b[0]) > 0.8 * W && (x.b[3] - x.b[1]) > 0.8 * H));
+    cands.sort((a, b) => b.p.length - a.p.length); cands = cands.slice(0, 6);
+    let best = null;
+    for (const c of cands) {
+      const r = AT.analyze(c.p, opts.ppf);
+      if (r.error || r.footprint < 150) continue;
+      r.textDensity = Math.round(c.d); r.parts = parts.length;
+      const b = c.b, t = opts.target;
+      const dist = t ? Math.hypot(Math.max(b[0] - t[0], 0, t[0] - b[2]), Math.max(b[1] - t[1], 0, t[1] - b[3])) : 0;
+      const area = G_area(r.building);
+      if (!best || dist < best.dist - 1e-6 || (Math.abs(dist - best.dist) < 1e-6 && area > best.area)) best = { r, dist, area };
+    }
+    return best ? best.r : null;
+  }
+  function G_area(P) { let a = 0; for (let i = 0; i < P.length; i++) { const p = P[i], q = P[(i + 1) % P.length]; a += p[0] * q[1] - q[0] * p[1]; } return Math.abs(a) / 2; }
 
   root.TakeoffAuto = AT;
   if (typeof module !== 'undefined' && module.exports) module.exports = AT;
