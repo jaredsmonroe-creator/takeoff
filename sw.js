@@ -1,4 +1,4 @@
-const CACHE = 'take-off-tool-v1.4.0';
+const CACHE = 'take-off-tool-v1.5.0';
 const CORE = ['./', './index.html', './style.css', './app.js', './geom.js', './autotrace.js', './manifest.webmanifest',
   './vendor/pdf.min.js', './vendor/pdf.worker.min.js', './icons/icon-180.png', './icons/icon-192.png', './icons/icon-512.png'];
 self.addEventListener('install', e => { e.waitUntil(caches.open(CACHE).then(c => c.addAll(CORE)).then(() => self.skipWaiting())); });

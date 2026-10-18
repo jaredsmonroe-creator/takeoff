@@ -3,7 +3,7 @@
   'use strict';
   const G = window.TakeoffGeom;
   const $ = id => document.getElementById(id);
-  const APP_VERSION = '1.4.0';
+  const APP_VERSION = '1.5.0';
   pdfjsLib.GlobalWorkerOptions.workerSrc = 'vendor/pdf.worker.min.js';
 
   const COLORS = ['#d62728', '#1f77b4', '#2ca02c', '#9467bd', '#ff7f0e', '#8c564b', '#e377c2', '#17becf', '#bcbd22', '#7f7f7f', '#393b79', '#e7298a'];
@@ -382,6 +382,8 @@
         if (vw * vh < 0.6 * S.pageW * S.pageH) target = [(el.clientWidth / 2 - S.view.tx) / S.view.s, (el.clientHeight / 2 - S.view.ty) / S.view.s];
       }
       const area = G.isArea(it.type);
+      let roofNote = '';
+      if (it.type === 'roof' && AT.roofByPitch) { const rt = await roofTrace(it, AT, segs, text, ppf, target, sc, readScale); if (rt === true) return; roofNote = rt || ''; }
       let r = AT.run(segs, S.pageW, S.pageH, { ppf, target, text });
       if (r.error && area && it.type !== 'garage_ceiling') r = AT.runSimple(segs, S.pageW, S.pageH, { ppf, target });
       spinner(false);
@@ -399,12 +401,47 @@
       const what = area ? Math.round(c.flat).toLocaleString() + ' sf' : c.lf.toFixed(1) + ' LF';
       zoomToPts(shapes[0].pts);
       const small = Math.max(S.pageW, S.pageH) < 0.9 * 72 * 36 && readScale;
-      traceBanner('✨ Auto Trace: <b>' + what + '</b>' + (area ? ' (flat)' : ' outside of walls') + ' — check the outline on the plan.' + esc(note) +
+      traceBanner('✨ Auto Trace: <b>' + what + '</b>' + (area ? ' (flat)' : ' outside of walls') + ' — check the outline on the plan.' + esc(note) + roofNote +
         (readScale ? '<br>Scale ' + esc(String(sc.short).replace(/\s*read$/, '')) + ' was read from the page' + (small ? ' – this sheet looks REDUCED, calibrate!' : ' – verify with 📐 Check.') : ''));
       window.__lastTrace = r;
     } catch (e) { console.error(e); spinner(false); alert(NOT_FOUND + '\n(' + e.message + ')'); }
   }
 
+  /* Roof with a pitch picked: trace only the roof faces labelled with that pitch (e.g. 8:12).
+     Returns true when it handled the trace (or told him why not); false = fall through to the whole outline. */
+  async function roofTrace(it, AT, segs, text, ppf, target, sc, readScale) {
+    const others = S.proj.items.filter(o => o.type === 'roof' && o.id !== it.id && o.page === S.pageNum);
+    const exclude = [].concat(...others.map(o => o.shapes.filter(sh => sh.pts.length >= 3).map(sh => sh.pts)));
+    const r = AT.roofByPitch(segs, S.pageW, S.pageH, { ppf, target, text, pitch: +it.pitch, exclude });
+    if (r.error) return false;
+    spinner(false);
+    const P = +it.pitch + '/12', list = a => (a || []).map(x => x + '/12').join(', ');
+    if (r.reason === 'alltaken') { alert('The ' + P + ' roof faces on this page are already in another Roof line (' + others.map(o => o.name).join(', ') + '). Nothing changed.'); return true; }
+    const roofPlan = r.pitches && r.pitches.length > 0;
+    if (r.mode !== 'pitch' && !roofPlan) { // no pitch labels on this page: the normal whole-outline trace runs, with a note
+      return +it.pitch ? '<br>⚠ No pitch labels found on this page – this is the <b>whole outline</b>. Move points or change the pitch.' : '';
+    }
+    const shapes = r.mode === 'pitch' ? r.sections.map(pts => ({ pts, closed: true })) : [{ pts: r.building, closed: true }];
+    snapshot(it); it.shapes = shapes; S.selPt = null;
+    autosave(); drawOverlay(); renderPanel(); updateHud();
+    const c = calc(it), n = shapes.length;
+    zoomToPts([].concat(...shapes.map(sh => sh.pts)));
+    let msg;
+    if (r.mode !== 'pitch') {
+      msg = '✨ Whole roof outline: <b>' + Math.round(c.flat).toLocaleString() + ' sf flat</b>' + (+it.pitch ? ' × ' + G.pitchFactor(it.pitch).toFixed(3) + ' = <b>' + Math.round(c.flat * G.pitchFactor(it.pitch)).toLocaleString() + ' sf</b>' : '') + '.';
+      if (+it.pitch) msg += '<br>⚠ No ' + P + ' label found on this roof plan (found ' + list(r.pitches) + ') – so this is the whole roof. Move points or change the pitch.';
+      else msg += '<br>Pitches on this plan: ' + list(r.pitches) + ' – pick one on the Roof line to trace just those faces.';
+      if (r.porchNear) msg += '<br>A porch roof may be inside this outline – check it.';
+    } else {
+      msg = '✨ Roof ' + P + ': <b>' + Math.round(c.flat).toLocaleString() + ' sf flat</b> × ' + G.pitchFactor(it.pitch).toFixed(3) + ' = <b>' + Math.round(c.flat * G.pitchFactor(it.pitch)).toLocaleString() + ' sf</b> · ' + n + ' section' + (n === 1 ? '' : 's') + ' (faces labelled ' + P + ').';
+      if (r.otherPitches && r.otherPitches.length) msg += '<br>Other pitches on this plan: ' + list(r.otherPitches) + ' – add a Roof line for each.';
+      if (r.porchNote) msg += '<br>⚠ This looks like a porch roof – check whether to count it.';
+    }
+    if (readScale) msg += '<br>Scale ' + esc(String(sc.short).replace(/\s*read$/, '')) + ' was read from the page – verify with 📐 Check.';
+    traceBanner(msg + ' Check the outline on the plan.', 20000);
+    window.__lastTrace = r;
+    return true;
+  }
   function zoomToPts(pts) {
     if (!pts || !pts.length) return;
     let x0 = 1e9, y0 = 1e9, x1 = -1e9, y1 = -1e9; pts.forEach(p => { x0 = Math.min(x0, p[0]); y0 = Math.min(y0, p[1]); x1 = Math.max(x1, p[0]); y1 = Math.max(y1, p[1]); });
@@ -412,10 +449,10 @@
     const s = Math.min(W / w, (H - 90) / h) * 0.85; S.view = { s, tx: W / 2 - (x0 + w / 2) * s, ty: 90 + (H - 90) / 2 - (y0 + h / 2) * s };
     applyView(); scheduleDetail();
   }
-  function traceBanner(html) {
+  function traceBanner(html, ms) {
     const h = $('hud'); h.innerHTML = '<div id="traceBanner">' + html + ' <button id="tbOk" class="okc">OK</button></div>';
     $('tbOk').onclick = () => { h.innerHTML = ''; updateHud(); };
-    clearTimeout(traceBanner._t); traceBanner._t = setTimeout(() => { if ($('traceBanner')) { h.innerHTML = ''; updateHud(); } }, 12000);
+    clearTimeout(traceBanner._t); traceBanner._t = setTimeout(() => { if ($('traceBanner')) { h.innerHTML = ''; updateHud(); } }, ms || 12000);
   }
 
   /* ---------------- items ---------------- */
@@ -652,6 +689,7 @@
       '<li>Tap the corners on the plan. For areas, tap the first point to close it. <b>New section</b> adds another piece to the same line. <b>↶ Undo</b> removes the last point. Drag a white dot to fix it.</li>' +
       '<li><b>Jogs / bump-outs:</b> press and hold anywhere on a line (about half a second) until it pulses, then drag without lifting – a new corner follows your finger. Or tap/drag the <b>+</b> in the middle of a line. To remove a point, press and hold it, then tap <b>🗑 Delete point</b>. Undo works for all of these.</li>' +
       '<li><b>✨ Auto Trace</b> (CAD/vector PDFs, not scans): add a line (Walls, Roof, Garage…) and tap <b>Auto Trace this page</b>. It draws ONE loop around the outside of the exterior walls – garage included – and zooms to it with the LF shown at the top. Move points to take out the garage or porches. Sheet with several plans? Zoom in on the one you want, or tap one spot inside it first. It skips schedules, notes and the title block. Shrunk printouts (11×17): calibrate the scale first. Undo puts it back.</li>' +
+      '<li><b>✨ Roof by pitch</b>: on the roof plan page add a Roof line, pick its pitch (e.g. 8/12), then Auto Trace. It traces only the roof faces labelled with that pitch (8:12, 8/12, 7"/12" or a pitch triangle) – one section per area – and skips faces you already put in another Roof line on that page, so do one Roof line per pitch. If it finds no matching label it traces the whole roof outline and says so. Pitch 0/12 (flat / none) = whole outline. Porch roofs get a ⚠ note; always check the faces against the plan.</li>' +
       '<li><b>⊾ Square</b> keeps lines straight up/down or left/right.</li>' +
       '<li>Tap <b>Done</b> when that line is finished.</li>' +
       '<li><b>💾 Save</b> → Save CSV → Files → Google Drive, so Tess can build the quote.</li>' +
@@ -677,7 +715,7 @@
 
   /* ---------------- panel ---------------- */
   function togglePanel(force) { S.panelOpen = force !== undefined ? force : !S.panelOpen; $('panel').classList.toggle('hidden', !S.panelOpen); setTimeout(() => { if (S.pdf) { applyView(); scheduleDetail(); } }, 50); }
-  function pitchOptions(sel) { let o = ''; for (let p = 0; p <= 16; p++) o += '<option value="' + p + '"' + (+sel === p ? ' selected' : '') + '>' + p + '/12' + (p === 0 ? ' (flat)' : '') + '</option>'; return o; }
+  function pitchOptions(sel) { let o = ''; for (let p = 0; p <= 16; p++) o += '<option value="' + p + '"' + (+sel === p ? ' selected' : '') + '>' + p + '/12' + (p === 0 ? ' (flat / none)' : '') + '</option>'; return o; }
   function floorOptions(sel) { return FLOORS.map(f => '<option' + (f === sel ? ' selected' : '') + '>' + f + '</option>').join(''); }
 
   function renderEditor() {

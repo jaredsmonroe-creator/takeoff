@@ -56,7 +56,13 @@
   /* text positions (page coords) – used to skip schedules / notes / title blocks */
   AT.textItems = async function (page, pdfjsLib) {
     const tc = await page.getTextContent(), VT = page.getViewport({ scale: 1 }).transform, out = [];
-    for (const t of tc.items) { if (!t.str || !t.str.trim()) continue; const m = pdfjsLib.Util.transform(VT, t.transform); out.push([m[4], m[5], t.str.trim().length]); }
+    for (const t of tc.items) {
+      if (!t.str || !t.str.trim()) continue; const m = pdfjsLib.Util.transform(VT, t.transform);
+      // centre of the text box: origin + half the width along the baseline + ~0.35 font size "up"
+      const fs = Math.hypot(m[2], m[3]) || 1, ax = Math.hypot(m[0], m[1]) || 1, dx = m[0] / ax, dy = m[1] / ax, ux = m[2] / fs, uy = m[3] / fs;
+      const w = (t.width || 0) * (Math.hypot(VT[0], VT[1]) || 1);
+      out.push([m[4], m[5], t.str.trim().length, t.str, m[4] + dx * w / 2 + ux * fs * 0.35, m[5] + dy * w / 2 + uy * fs * 0.35, fs]);
+    }
     return out;
   };
   /* points-per-foot from a printed note like 1/4" = 1'-0" (most common one on the page) */
@@ -412,23 +418,38 @@
   /* fallback for area lines when no wall pairs exist (e.g. a roof plan): try each heavy line weight */
   AT.runSimple = function (segs, W, H, opts) {
     const long_ = Math.max(W, H), thr = 0.006 * long_, ppf = opts.ppf, byW = new Map(), tb = AT.titleBox(segs, W, H);
-    for (const s of segs) { const L = Math.hypot(s[2] - s[0], s[3] - s[1]); if (Math.min(s[0], s[2]) > tb[0] + 2 && Math.max(s[0], s[2]) < tb[2] - 2 && Math.min(s[1], s[3]) > tb[1] + 2 && Math.max(s[1], s[3]) < tb[3] - 2 && !s[6] && !s[7] && L > thr && L < 0.6 * Math.min(W, H) && s[4] > 0) { if (!byW.has(s[4])) byW.set(s[4], []); byW.get(s[4]).push(s); } }
-    let best = null;
+    const pool = [], tot = new Map();
+    for (const s of segs) { const L = Math.hypot(s[2] - s[0], s[3] - s[1]); if (Math.min(s[0], s[2]) > tb[0] + 2 && Math.max(s[0], s[2]) < tb[2] - 2 && Math.min(s[1], s[3]) > tb[1] + 2 && Math.max(s[1], s[3]) < tb[3] - 2 && !s[6] && !s[7] && L > thr && L < 0.9 * Math.max(W, H) && s[4] > 0) { pool.push(s); tot.set(s[4], (tot.get(s[4]) || 0) + L); } }
+    // roof edges, hips and ridges are often drawn in two or three heavy weights: try "this weight and everything heavier"
+    const ws = [...tot.keys()].filter(w => tot.get(w) > 20 * ppf).sort((a, b) => b - a);
+    for (const w of ws) byW.set(w, pool.filter(s => s[4] >= w - 1e-6));
+    const all = [], labels = opts.labels || [];
     for (const [w, ls0] of byW) {
       if (ls0.length < 8) continue;
-      let ls = ls0; const parts = AT.split(ls, 0.02 * long_).filter(p => p.length >= 8);
+      const parts = AT.split(ls0, 0.02 * long_).filter(p => p.length >= 8);
       if (!parts.length) continue;
-      if (opts.target) { const t = opts.target; ls = parts.map(p => { const b = bbox(p); return [Math.hypot(Math.max(b[0] - t[0], 0, t[0] - b[2]), Math.max(b[1] - t[1], 0, t[1] - b[3])), p]; }).sort((a, b) => a[0] - b[0])[0][1]; }
-      else ls = parts.reduce((a, b) => (b.length > a.length ? b : a));
-      const b = bbox(ls);
-      if (b[0] < 0.04 * W || b[2] > 0.96 * W || b[1] < 0.04 * H || b[3] > 0.96 * H) continue; // title block / sheet border
-      const r = simpleOutline(ls, ppf); if (r.error || r.footprint < 200) continue;
-      const pageSf = W * H / (ppf * ppf); if (r.footprint > 0.5 * pageSf) continue;
-      let score = r.footprint;
-      if (opts.target) { const t = opts.target; const inside = G_inPoly(t, r.building); score = (inside ? 1e9 : 0) + r.footprint; }
-      if (!best || score > best.score || (score === best.score && w > best.weight)) best = Object.assign(r, { score, weight: w, nlines: ls.length, parts: parts.length });
+      parts.sort((a, b) => b.length - a.length);
+      for (const ls of parts.slice(0, 4)) {
+        const b = bbox(ls);
+        if (b[0] < Math.max(tb[0] + 4, 0.015 * W) || b[2] > Math.min(tb[2] - 4, 0.985 * W) || b[1] < Math.max(tb[1] + 4, 0.015 * H) || b[3] > Math.min(tb[3] - 4, 0.985 * H)) continue; // title block / sheet border
+        const r = simpleOutline(ls, ppf); if (r.error || r.footprint < 200) continue;
+        const pageSf = W * H / (ppf * ppf); if (r.footprint > 0.5 * pageSf) continue;
+        // tier: tapped/visible spot inside first, then (roof plans) the number of pitch labels inside the shape
+        const tIn = opts.target && G_inPoly(opts.target, r.building) ? 1 : 0;
+        const tDist = opts.target ? Math.hypot(Math.max(b[0] - opts.target[0], 0, opts.target[0] - b[2]), Math.max(b[1] - opts.target[1], 0, opts.target[1] - b[3])) : 0;
+        const nLab = labels.filter(l => G_inPoly([l.x, l.y], r.building)).length;
+        all.push(Object.assign(r, { tIn, tDist, nLab, score: r.footprint, weight: w, nlines: ls.length, parts: parts.length, ls }));
+      }
     }
-    return best || { error: 'nowalls' };
+    if (!all.length) return { error: 'nowalls' };
+    const tier = r => r.tIn * 1e6 + Math.min(r.nLab, 999) * 1e3 - Math.min(r.tDist, 999);
+    // keep the best drawing (tier), then the thickest line weight whose closed shape is nearly as big as the biggest one
+    // (roof edges/hips are drawn heavier than shingle hatching or the floor plan underneath)
+    const bt = Math.max(...all.map(tier)), same = all.filter(r => tier(r) >= bt - 50 || (r.tIn && bt >= 1e6));
+    const top = Math.max(...same.map(r => r.footprint));
+    const ok = same.filter(r => r.footprint >= 0.6 * top).sort((a, b) => b.weight - a.weight || b.footprint - a.footprint);
+    const best = ok[0]; best.cands = all.map(r => r.weight + ':' + Math.round(r.footprint) + (r.nLab ? 'L' + r.nLab : '')).join(',');
+    return best;
   };
   function G_inPoly(p, poly) { let c = false; for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) { const a = poly[i], b = poly[j]; if ((a[1] > p[1]) !== (b[1] > p[1]) && p[0] < (b[0] - a[0]) * (p[1] - a[1]) / (b[1] - a[1]) + a[0]) c = !c; } return c; }
 
@@ -465,6 +486,146 @@
     return best ? best.r : null;
   }
   function G_area(P) { let a = 0; for (let i = 0; i < P.length; i++) { const p = P[i], q = P[(i + 1) % P.length]; a += p[0] * q[1] - q[0] * p[1]; } return Math.abs(a) / 2; }
+
+
+  /* ---------- 6. roof planes by pitch label ---------- */
+  /* pitch labels from text items: "8:12", "8/12", "8 12", or a pitch triangle drawn as separate "8" and "12" */
+  AT.pitchLabels = function (text) {
+    const out = [], singles = [], twelves = [], porch = [];
+    for (const t of text || []) {
+      const str = (t[3] || '').trim(); if (!str) continue;
+      const cx = t[4], cy = t[5], fs = t[6] || 8;
+      if (/PORCH/i.test(str)) porch.push([cx, cy]);
+      const IN = '\\s*(?:"|”|\'\'|IN\\.?)?\\s*';
+      let m = str.match(new RegExp('(?:^|[^\\d./])(\\d{1,2}(?:\\.\\d+)?)' + IN + '[:\\/]\\s*12' + IN + '(?![\\d\'’])')) || str.match(/^(\d{1,2}(?:\.\d+)?)\s+12$/);
+      if (m && +m[1] > 0 && +m[1] <= 24) { out.push({ x: cx, y: cy, rise: +m[1], str }); continue; }
+      if (/^12$/.test(str)) twelves.push({ x: cx, y: cy, fs });
+      else if (/^\d{1,2}(\.\d+)?$/.test(str) && +str > 0 && +str <= 24) singles.push({ x: cx, y: cy, fs, v: +str });
+    }
+    const used = new Set();
+    for (const tw of twelves) {
+      let best = null, bd = 4 * tw.fs;
+      singles.forEach((sg, i) => { if (used.has(i)) return; const d = Math.hypot(sg.x - tw.x, sg.y - tw.y); if (d < bd) { bd = d; best = i; } });
+      if (best !== null) { used.add(best); const sg = singles[best]; out.push({ x: (sg.x + tw.x) / 2, y: (sg.y + tw.y) / 2, rise: sg.v, str: sg.v + ' / 12 (triangle)', tri: true }); }
+    }
+    return { labels: out, porch };
+  };
+  /* signed loops of a mask (outer loops one orientation, holes the other) */
+  function allLoops(M, W, H) {
+    const out = new Map(), key = (i, j) => j * (W + 1) + i;
+    const add = (a, b) => { if (!out.has(a)) out.set(a, []); out.get(a).push(b); };
+    for (let p = 0; p < W * H; p++) if (M[p]) {
+      const i = p % W, j = (p - i) / W;
+      if (j === 0 || !M[p - W]) add(key(i, j), key(i + 1, j));
+      if (i + 1 >= W || !M[p + 1]) add(key(i + 1, j), key(i + 1, j + 1));
+      if (j + 1 >= H || !M[p + W]) add(key(i + 1, j + 1), key(i, j + 1));
+      if (i === 0 || !M[p - 1]) add(key(i, j + 1), key(i, j));
+    }
+    const loops = [];
+    for (const [start] of out) {
+      while (out.get(start).length) {
+        const pts = []; let v = start, guard = 0;
+        do { const l = out.get(v); if (!l || !l.length) break; const to = l.pop(); pts.push([v % (W + 1), Math.floor(v / (W + 1))]); v = to; } while (v !== start && ++guard < 1e7);
+        if (pts.length < 4) continue;
+        let A = 0; for (let k = 0; k < pts.length; k++) { const a = pts[k], b = pts[(k + 1) % pts.length]; A += a[0] * b[1] - b[0] * a[1]; }
+        loops.push({ pts, A: A / 2 });
+      }
+    }
+    return loops;
+  }
+  /* join holes to their outer loop through a zero-width slit so one simple point list carries the hole */
+  function keyhole(outer, holes) {
+    let P = outer.slice();
+    for (const h of holes) {
+      let bi = 0, bj = 0, bd = 1e18;
+      for (let i = 0; i < P.length; i++) for (let j = 0; j < h.length; j++) { const d = (P[i][0] - h[j][0]) ** 2 + (P[i][1] - h[j][1]) ** 2; if (d < bd) { bd = d; bi = i; bj = j; } }
+      const hr = h.slice(bj).concat(h.slice(0, bj + 1));
+      P = P.slice(0, bi + 1).concat(hr, [P[bi].slice()], P.slice(bi + 1));
+    }
+    return P;
+  }
+  /*
+   * opts: {ppf, target, text (AT.textItems), pitch (rise per 12, 0 = whole roof), exclude: [[pts]] (taken by other Roof lines)}
+   * returns {building, sections:[pts], faces:[...], mode:'pitch'|'whole', reason, pitches, otherPitches, porchNote}
+   */
+  AT.roofByPitch = function (segs, W, H, opts) {
+    const { labels, porch } = AT.pitchLabels(opts.text);
+    const base = AT.runSimple(segs, W, H, Object.assign({}, opts, { labels }));
+    if (base.error) return base;
+    const res = Object.assign({}, base, { mode: 'whole', sections: [base.building], faces: [] });
+    const ppf = opts.ppf, outl = base.building, ls = base.ls || [];
+    const inOut = labels.filter(l => G_inPoly([l.x, l.y], outl));
+    res.pitches = [...new Set(inOut.map(l => l.rise))].sort((a, b) => b - a);
+    const lb = bbox(ls);
+    res.porchNear = porch.some(p => p[0] > lb[0] - 15 * ppf && p[0] < lb[2] + 15 * ppf && p[1] > lb[1] - 15 * ppf && p[1] < lb[3] + 15 * ppf);
+    if (!opts.pitch) { res.reason = 'nopitch'; return res; }
+    if (!inOut.length) { res.reason = 'nolabels'; return res; }
+    // grid of roof faces: cells inside the outline, cut by the roof lines (eaves, ridges, hips, valleys)
+    const cell = 0.25, c = cell * ppf, pad = 3, ob = bbox(outl.map(p => [p[0], p[1], p[0], p[1]]));
+    const x0 = ob[0] - pad * c, y0 = ob[1] - pad * c, GW = Math.ceil((ob[2] - ob[0]) / c) + 2 * pad, GH = Math.ceil((ob[3] - ob[1]) / c) + 2 * pad;
+    if (GW * GH > 6e6) return Object.assign(res, { reason: 'toobig' });
+    const g = new Uint8Array(GW * GH);
+    for (const s of ls) {
+      const L = Math.hypot(s[2] - s[0], s[3] - s[1]), n = Math.ceil(L / (c * 0.5)) + 1;
+      for (let q = 0; q <= n; q++) { const x = s[0] + (s[2] - s[0]) * q / n, y = s[1] + (s[3] - s[1]) * q / n, i = Math.floor((x - x0) / c), j = Math.floor((y - y0) / c); if (i >= 0 && j >= 0 && i < GW && j < GH) g[j * GW + i] = 1; }
+    }
+    const gl = dil(g, GW, GH, 1), M = new Uint8Array(GW * GH);
+    for (let j = 0; j < GH; j++) for (let i = 0; i < GW; i++) if (G_inPoly([x0 + (i + 0.5) * c, y0 + (j + 0.5) * c], outl)) M[j * GW + i] = 1;
+    const free = new Uint8Array(GW * GH); for (let p = 0; p < GW * GH; p++) free[p] = M[p] && !gl[p] ? 1 : 0;
+    const comps = components(free, GW, GH).filter(cc => cc.length * cell * cell >= 3);
+    const own = new Int32Array(GW * GH).fill(-1), q = new Int32Array(GW * GH); let h = 0, t = 0;
+    comps.forEach((cc, k) => cc.forEach(p => { own[p] = k; q[t++] = p; }));
+    while (h < t) { // hand the line cells to the neighbouring faces (half each side)
+      const p = q[h++], x = p % GW, y = (p - x) / GW;
+      for (const n of [x + 1 < GW ? p + 1 : -1, x > 0 ? p - 1 : -1, y + 1 < GH ? p + GW : -1, y > 0 ? p - GW : -1]) if (n >= 0 && M[n] && own[n] < 0) { own[n] = own[p]; q[t++] = n; }
+    }
+    const cellOf = (x, y) => { const i = Math.floor((x - x0) / c), j = Math.floor((y - y0) / c); return i >= 0 && j >= 0 && i < GW && j < GH ? j * GW + i : -1; };
+    const faces = comps.map(() => ({ cells: 0, labels: [], porch: false, taken: 0, sx: 0, sy: 0 }));
+    for (let p = 0; p < GW * GH; p++) if (own[p] >= 0) { const f = faces[own[p]], x = p % GW; f.cells++; f.sx += x; f.sy += (p - x) / GW; }
+    for (const l of inOut) { const p = cellOf(l.x, l.y); if (p >= 0 && own[p] >= 0) faces[own[p]].labels.push(l.rise); }
+    for (const pp of porch) { const p = cellOf(pp[0], pp[1]); if (p >= 0 && own[p] >= 0) faces[own[p]].porch = true; }
+    faces.forEach(f => {
+      f.area = f.cells * cell * cell; f.cx = x0 + (f.sx / f.cells + 0.5) * c; f.cy = y0 + (f.sy / f.cells + 0.5) * c;
+      if (f.labels.length) { const cnt = {}; f.labels.forEach(r => cnt[r] = (cnt[r] || 0) + 1); f.pitch = +Object.keys(cnt).sort((a, b) => cnt[b] - cnt[a])[0]; f.labelled = true; }
+    });
+    // unlabelled faces take the pitch of the nearest label (distance from the label to the face itself)
+    const bestD = faces.map(() => 1e18);
+    for (let p = 0; p < GW * GH; p++) {
+      const k = own[p]; if (k < 0 || faces[k].labelled) continue;
+      const x = p % GW, y = (p - x) / GW, px = x0 + (x + 0.5) * c, py = y0 + (y + 0.5) * c;
+      for (const l of inOut) { const d = (px - l.x) ** 2 + (py - l.y) ** 2; if (d < bestD[k]) { bestD[k] = d; faces[k].pitch = l.rise; } }
+    }
+    // faces already covered by other Roof lines on this page
+    const ex = opts.exclude || [];
+    if (ex.length) for (let p = 0; p < GW * GH; p++) if (own[p] >= 0) { const x = p % GW, y = (p - x) / GW; if ((x + y) % 2) continue; const pt = [x0 + (x + 0.5) * c, y0 + (y + 0.5) * c]; if (ex.some(P => G_inPoly(pt, P))) faces[own[p]].taken += 2; }
+    faces.forEach(f => { f.taken = f.taken > 0.5 * f.cells; });
+    const sel = faces.map(f => f.pitch === opts.pitch && !f.taken);
+    res.faces = faces.map(f => ({ area: +f.area.toFixed(1), pitch: f.pitch, labelled: !!f.labelled, porch: f.porch, taken: f.taken, cx: f.cx, cy: f.cy }));
+    if (!sel.some(Boolean)) { res.reason = faces.some(f => f.pitch === opts.pitch) ? 'alltaken' : 'nomatch'; return res; }
+    const S = new Uint8Array(GW * GH); for (let p = 0; p < GW * GH; p++) if (own[p] >= 0 && sel[own[p]]) S[p] = 1;
+    // corners: snap to roof-line endpoints / outline corners
+    const corners = []; for (const s of ls) corners.push([s[0], s[1]], [s[2], s[3]]); outl.forEach(p => corners.push(p));
+    const snap = P => P.map(p => { let b = null, bd = (1.25 * ppf) ** 2; for (const k of corners) { const d = (k[0] - p[0]) ** 2 + (k[1] - p[1]) ** 2; if (d < bd) { bd = d; b = k; } } return b ? [b[0], b[1]] : p; });
+    const clean = P => { const o = []; for (const p of P) { const l = o[o.length - 1]; if (!l || Math.hypot(l[0] - p[0], l[1] - p[1]) > 0.05) o.push(p); } if (o.length > 1 && Math.hypot(o[0][0] - o[o.length - 1][0], o[0][1] - o[o.length - 1][1]) < 0.05) o.pop(); return o; };
+    const toPt = v => [x0 + v[0] * c, y0 + v[1] * c];
+    const sections = [];
+    for (const cc of components(S, GW, GH)) {
+      if (cc.length * cell * cell < 3) continue;
+      const m1 = new Uint8Array(GW * GH); cc.forEach(p => m1[p] = 1);
+      const loops = allLoops(m1, GW, GH); if (!loops.length) continue;
+      loops.sort((a, b) => Math.abs(b.A) - Math.abs(a.A));
+      const outer = loops[0], sg = Math.sign(outer.A);
+      const fix = l => clean(snap(simplifyClosed(l.pts.map(toPt), 1.6 * c)));
+      const holes = loops.slice(1).filter(l => Math.sign(l.A) !== sg && Math.abs(l.A) * cell * cell >= 6).map(fix).filter(P => P.length >= 3);
+      const O = fix(outer); if (O.length < 3) continue;
+      sections.push(holes.length ? keyhole(O, holes) : O);
+    }
+    if (!sections.length) { res.reason = 'nomatch'; return res; }
+    res.mode = 'pitch'; res.sections = sections;
+    res.porchNote = faces.some((f, k) => sel[k] && f.porch) || (res.porchNear && opts.pitch === Math.min(...res.pitches) && res.pitches.length > 1);
+    res.otherPitches = res.pitches.filter(r => r !== opts.pitch);
+    return res;
+  };
 
   root.TakeoffAuto = AT;
   if (typeof module !== 'undefined' && module.exports) module.exports = AT;
