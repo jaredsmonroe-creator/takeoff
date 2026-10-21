@@ -52,8 +52,13 @@ button.danger { background:#c0392b; color:#fff; border-color:#c0392b; }
 #list .nm { flex:1; } #list .nm b { display:block; } #list .nm small { color:#5a6875; }
 #list .val { font-weight:800; font-size:18px; white-space:nowrap; }
 #totals { border-top:2px solid #1b2733; margin-top:8px; padding-top:8px; }
-#totals .t { display:flex; justify-content:space-between; padding:3px 4px; }
-#totals .g { font-size:20px; font-weight:800; }
+#totals .t { display:grid; grid-template-columns:minmax(0,1fr) auto minmax(86px,auto); column-gap:10px; align-items:baseline; padding:3px 4px; }
+#totals .t > :nth-child(n+2) { text-align:right; white-space:nowrap; }
+#totals .t > :first-child { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+#totals .h { font-size:12px; color:#5a6875; font-weight:700; padding-bottom:0; }
+#list .val { text-align:right; }
+#list .val .money { display:block; font-size:13px; font-weight:700; color:#1e7e34; }
+#totals .g { font-size:18px; border-top:1px solid var(--line); padding-top:5px; font-weight:800; }
 #modal { position:fixed; inset:0; background:rgba(0,0,0,.45); z-index:50; display:flex; align-items:center; justify-content:center; padding:16px; }
 #modal.hidden { display:none; }
 .modalbox { background:#fff; border-radius:16px; padding:16px; width:min(560px,100%); max-height:90%; overflow-y:auto; }

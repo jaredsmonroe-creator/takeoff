@@ -3,7 +3,7 @@
   'use strict';
   const G = window.TakeoffGeom;
   const $ = id => document.getElementById(id);
-  const APP_VERSION = '1.6.0';
+  const APP_VERSION = '1.6.1';
   pdfjsLib.GlobalWorkerOptions.workerSrc = 'vendor/pdf.worker.min.js';
 
   const COLORS = ['#d62728', '#1f77b4', '#2ca02c', '#9467bd', '#ff7f0e', '#8c564b', '#e377c2', '#17becf', '#bcbd22', '#7f7f7f', '#393b79', '#e7298a'];
@@ -774,7 +774,7 @@
   function renderList() {
     const L = $('list');
     if (!S.proj.items.length) { L.innerHTML = '<p class="sub" style="color:#5a6875">No measurements yet. Tap a + button above.</p>'; $('totals').innerHTML = ''; return; }
-    const tot = {}; let grand = 0, missing = 0, money = 0, priced = 0;
+    const tot = {}; let grand = 0, missing = 0, money = 0, priced = 0; const totM = {};
     L.innerHTML = S.proj.items.map(it => {
       const c = calc(it);
       if (c.sf !== null) { tot[it.type] = (tot[it.type] || 0) + c.sf; grand += c.sf; } else if (it.shapes.length) missing++;
@@ -782,13 +782,14 @@
       if (it.type === 'roof') det += ' · ' + (it.pitch || 0) + '/12';
       if (G.isLength(it.type)) det += ' · ' + (c.lf === null ? '—' : c.lf.toFixed(1)) + ' LF × ' + G.fmtFtIn(+it.height).replace(/ 0"$/, '');
       else if (c.flat !== null) det += ' · flat ' + Math.round(c.flat);
-      const lt = G.lineTotal(it, c.sf); if (lt !== null) { money += lt; priced++; det += ' · $' + G.itemPrice(it) + '/sf = ' + G.fmtMoney(lt); }
+      const lt = G.lineTotal(it, c.sf); if (lt !== null) { money += lt; priced++; totM[it.type] = (totM[it.type] || 0) + lt; det += ' · $' + G.itemPrice(it) + '/sf = ' + G.fmtMoney(lt); }
       return '<div class="item' + (it.id === S.activeId ? ' active' : '') + '" data-id="' + it.id + '"><span class="sw" style="background:' + it.color + '"></span><span class="nm"><b>' + esc(it.name) + '</b><small>' + esc(det) + '</small></span><span class="val">' + fmtSF(c.sf) + '</span></div>';
     }).join('');
     L.querySelectorAll('.item').forEach(el => el.onclick = () => selectItem(+el.dataset.id));
-    let th = Object.keys(G.TYPE_LABELS).filter(t => tot[t] !== undefined).map(t => '<div class="t"><span>' + G.TYPE_LABELS[t] + '</span><b>' + fmtSF(tot[t]) + '</b></div>').join('');
-    th += '<div class="t g"><span>Total</span><span>' + fmtSF(grand) + '</span></div>';
-    if (priced) th += '<div class="t g"><span>Total $ (' + priced + ' priced line' + (priced === 1 ? '' : 's') + ')</span><span>' + G.fmtMoney(money) + '</span></div>';
+    const m = v => v === undefined ? '—' : G.fmtMoney(v);
+    let th = '<div class="t h"><span></span><span>SF</span><span>Price</span></div>';
+    th += Object.keys(G.TYPE_LABELS).filter(t => tot[t] !== undefined).map(t => '<div class="t"><span>' + G.TYPE_LABELS[t] + '</span><b>' + fmtSF(tot[t]) + '</b><b>' + m(totM[t]) + '</b></div>').join('');
+    th += '<div class="t g"><span>Total</span><span>' + fmtSF(grand) + '</span><span>' + (priced ? G.fmtMoney(money) : '—') + '</span></div>';
     if (missing) th += '<p style="color:#c0392b">' + missing + ' item(s) need a scale on their page.</p>';
     $('totals').innerHTML = th;
   }
