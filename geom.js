@@ -99,30 +99,37 @@
     return out;
   };
 
+  G.itemPrice = it => { const p = it && it.price; return (p === null || p === undefined || p === '' || isNaN(+p)) ? null : +p; };
+  G.lineTotal = (it, sf) => { const p = G.itemPrice(it); return (p === null || sf === null || sf === undefined) ? null : Math.round(sf) * p; };
+  G.fmtMoney = v => (v === null || v === undefined || isNaN(v)) ? '' : '$' + v.toFixed(2).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+
   G.csvEscape = v => { v = (v === null || v === undefined) ? '' : String(v); return /[",\n\r]/.test(v) ? '"' + v.replace(/"/g, '""') + '"' : v; };
 
   /* Build CSV text from a project + per-page scales */
   G.buildCSV = function (proj) {
-    const rows = [['Job', 'Line', 'Name', 'Type', 'Page', 'Scale', 'LF', 'Height', 'Pitch', 'Flat SF', 'Qty', 'Adjust SF', 'SF']];
-    const totals = {}; let grand = 0;
+    const rows = [['Job', 'Line', 'Name', 'Type', 'Page', 'Scale', 'LF', 'Height', 'Pitch', 'Flat SF', 'Qty', 'Adjust SF', 'SF', 'Price/SF', 'Line Total']];
+    const totals = {}; let grand = 0, money = 0, priced = 0;
     proj.items.forEach((it, i) => {
       const sc = proj.scales[it.page];
       const c = G.itemCalc(it, sc && sc.ftPerPt);
       const sf = c.sf === null ? '' : Math.round(c.sf);
       if (c.sf !== null) { totals[it.type] = (totals[it.type] || 0) + c.sf; grand += c.sf; }
+      const lt = G.lineTotal(it, c.sf); if (lt !== null) { money += lt; priced++; }
       rows.push([
         proj.jobName || '', i + 1, it.name, G.TYPE_LABELS[it.type] || it.type, it.page, sc ? sc.label : 'NOT SET',
         c.lf === null ? '' : c.lf.toFixed(1),
         G.isLength(it.type) ? G.fmtFtIn(+it.height || 0) : '',
         it.type === 'roof' ? (it.pitch || 0) + '/12' : '',
         c.flat === null ? '' : Math.round(c.flat),
-        it.qty === undefined || it.qty === '' ? 1 : it.qty, +it.adjust || 0, sf
+        it.qty === undefined || it.qty === '' ? 1 : it.qty, +it.adjust || 0, sf,
+        G.itemPrice(it) === null ? '' : G.itemPrice(it).toFixed(2), lt === null ? '' : lt.toFixed(2)
       ]);
     });
     rows.push([]);
     rows.push(['', '', 'TOTALS BY TYPE']);
     Object.keys(G.TYPE_LABELS).forEach(t => { if (totals[t] !== undefined) rows.push(['', '', G.TYPE_LABELS[t], '', '', '', '', '', '', '', '', '', Math.round(totals[t])]); });
     rows.push(['', '', 'GRAND TOTAL', '', '', '', '', '', '', '', '', '', Math.round(grand)]);
+    if (priced) rows.push(['', '', 'GRAND TOTAL $', '', '', '', '', '', '', '', '', '', '', '', money.toFixed(2)]);
     return rows.map(r => r.map(G.csvEscape).join(',')).join('\r\n') + '\r\n';
   };
 

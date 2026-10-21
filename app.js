@@ -3,7 +3,7 @@
   'use strict';
   const G = window.TakeoffGeom;
   const $ = id => document.getElementById(id);
-  const APP_VERSION = '1.5.0';
+  const APP_VERSION = '1.6.0';
   pdfjsLib.GlobalWorkerOptions.workerSrc = 'vendor/pdf.worker.min.js';
 
   const COLORS = ['#d62728', '#1f77b4', '#2ca02c', '#9467bd', '#ff7f0e', '#8c564b', '#e377c2', '#17becf', '#bcbd22', '#7f7f7f', '#393b79', '#e7298a'];
@@ -31,6 +31,9 @@
   /* ---------------- persistence ---------------- */
   const LS_KEY = 'epicTakeoff.project.v1';
   let saveTimer = 0;
+  const LP_KEY = 'takeoff_lastPrices';
+  function lastPrices() { try { return JSON.parse(localStorage.getItem(LP_KEY) || '{}') || {}; } catch (e) { return {}; } }
+  function setLastPrice(type, v) { try { const m = lastPrices(); if (v === null) delete m[type]; else m[type] = v; localStorage.setItem(LP_KEY, JSON.stringify(m)); } catch (e) { } }
   function autosave() { clearTimeout(saveTimer); saveTimer = setTimeout(() => { try { S.proj.updated = new Date().toISOString(); localStorage.setItem(LS_KEY, JSON.stringify(S.proj)); } catch (e) { console.warn(e); } }, 300); }
   function idb() {
     return new Promise((res, rej) => { const r = indexedDB.open('epicTakeoff', 1); r.onupgradeneeded = () => r.result.createObjectStore('files'); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); });
@@ -460,7 +463,7 @@
     if (!S.pdf) { toast('Open a plan first'); return; }
     finishTool();
     const count = S.proj.items.filter(i => i.type === type).length + 1;
-    const it = { id: S.proj.nextId++, type, name: G.TYPE_LABELS[type] + (count > 1 ? ' ' + count : ''), page: S.pageNum, shapes: [], qty: 1, adjust: 0, color: TYPE_COLOR[type] };
+    const it = { id: S.proj.nextId++, type, name: G.TYPE_LABELS[type] + (count > 1 ? ' ' + count : ''), page: S.pageNum, shapes: [], qty: 1, adjust: 0, price: (lastPrices()[type] !== undefined ? lastPrices()[type] : null), color: TYPE_COLOR[type] };
     // vary color within same type
     if (count > 1) it.color = COLORS[(S.proj.nextId + 3) % COLORS.length];
     if (type === 'roof') it.pitch = S.proj.lastPitch !== undefined ? S.proj.lastPitch : 6;
@@ -733,6 +736,7 @@
     }
     h += '<div class="row"><label>Qty ×</label><input id="edQty" class="short" inputmode="decimal" value="' + esc(it.qty) + '">';
     h += '<label>' + (G.isLength(it.type) ? 'Deduct/add sf' : 'Add/deduct sf') + '</label><input id="edAdj" class="short" inputmode="numbers-and-punctuation" value="' + esc(it.adjust || 0) + '"></div>';
+    h += '<div class="row"><label>Price $/SF</label><input id="edPrice" class="short" type="text" inputmode="decimal" placeholder="none" value="' + (G.itemPrice(it) === null ? '' : esc(it.price)) + '"><span class="sub" id="edMoney">' + (G.lineTotal(it, c.sf) === null ? '' : '= ' + G.fmtMoney(G.lineTotal(it, c.sf))) + '</span></div>';
     h += '<div class="row"><span class="big" id="edSF">' + fmtSF(c.sf) + '</span><span class="sub" id="edSub">' + subText(it, c) + '</span></div>';
     h += '<button id="edAuto" class="primary" style="width:100%;margin-top:8px">✨ Auto Trace this page</button>';
     h += '<div class="btns"><button id="edUndo">↶ Undo</button><button id="edSec">' + (area ? '＋ New section' : '＋ New run') + '</button><button id="edDone" class="okc">✓ Done</button></div>';
@@ -751,6 +755,7 @@
     if ($('edHeight')) $('edHeight').onchange = e => { const v = G.parseFtIn(e.target.value); if (isNaN(v) || v < 0) { toast('Type a height like 9\'1"'); renderEditor(); return; } it.height = v; S.proj.lastHeights[it.floor] = v; changed(); };
     $('edQty').onchange = e => { const v = parseFloat(e.target.value); it.qty = isNaN(v) ? 1 : v; changed(); };
     $('edAdj').onchange = e => { const v = parseFloat(e.target.value); it.adjust = isNaN(v) ? 0 : v; changed(); };
+    $('edPrice').onchange = e => { const s = e.target.value.replace(/[$,\s]/g, ''); const v = s === '' ? null : parseFloat(s); if (s !== '' && (isNaN(v) || v < 0)) { toast('Type a price like 1.84'); setTimeout(renderEditor, 0); return; } it.price = v; setLastPrice(it.type, v); setTimeout(changed, 0); };
     $('edUndo').onclick = undoPoint; $('edSec').onclick = newSection;
     $('edAuto').onclick = () => autoTrace(it);
     $('edDone').onclick = () => { const sh = it.shapes[it.shapes.length - 1]; if (sh) sh.closed = true; S.activeId = null; S.selPt = null; updateHud(); autosave(); renderPanel(); drawOverlay(); };
@@ -764,12 +769,12 @@
     return c.lf.toFixed(1) + ' LF × ' + G.fmtFtIn(+it.height, 4).replace(/ 0"$/, '') + ' · ' + n + ' run' + (n === 1 ? '' : 's');
   }
   function changed() { autosave(); renderPanel(); drawOverlay(); }
-  function refreshPanelLive() { const it = activeItem(); if (!it || !$('edSF')) return; const c = calc(it); $('edSF').textContent = fmtSF(c.sf); $('edSub').textContent = subText(it, c); }
+  function refreshPanelLive() { const it = activeItem(); if (!it || !$('edSF')) return; const c = calc(it); $('edSF').textContent = fmtSF(c.sf); $('edSub').textContent = subText(it, c); const lt = G.lineTotal(it, c.sf); if ($('edMoney')) $('edMoney').textContent = lt === null ? '' : '= ' + G.fmtMoney(lt); }
 
   function renderList() {
     const L = $('list');
     if (!S.proj.items.length) { L.innerHTML = '<p class="sub" style="color:#5a6875">No measurements yet. Tap a + button above.</p>'; $('totals').innerHTML = ''; return; }
-    const tot = {}; let grand = 0, missing = 0;
+    const tot = {}; let grand = 0, missing = 0, money = 0, priced = 0;
     L.innerHTML = S.proj.items.map(it => {
       const c = calc(it);
       if (c.sf !== null) { tot[it.type] = (tot[it.type] || 0) + c.sf; grand += c.sf; } else if (it.shapes.length) missing++;
@@ -777,11 +782,13 @@
       if (it.type === 'roof') det += ' · ' + (it.pitch || 0) + '/12';
       if (G.isLength(it.type)) det += ' · ' + (c.lf === null ? '—' : c.lf.toFixed(1)) + ' LF × ' + G.fmtFtIn(+it.height).replace(/ 0"$/, '');
       else if (c.flat !== null) det += ' · flat ' + Math.round(c.flat);
+      const lt = G.lineTotal(it, c.sf); if (lt !== null) { money += lt; priced++; det += ' · $' + G.itemPrice(it) + '/sf = ' + G.fmtMoney(lt); }
       return '<div class="item' + (it.id === S.activeId ? ' active' : '') + '" data-id="' + it.id + '"><span class="sw" style="background:' + it.color + '"></span><span class="nm"><b>' + esc(it.name) + '</b><small>' + esc(det) + '</small></span><span class="val">' + fmtSF(c.sf) + '</span></div>';
     }).join('');
     L.querySelectorAll('.item').forEach(el => el.onclick = () => selectItem(+el.dataset.id));
     let th = Object.keys(G.TYPE_LABELS).filter(t => tot[t] !== undefined).map(t => '<div class="t"><span>' + G.TYPE_LABELS[t] + '</span><b>' + fmtSF(tot[t]) + '</b></div>').join('');
     th += '<div class="t g"><span>Total</span><span>' + fmtSF(grand) + '</span></div>';
+    if (priced) th += '<div class="t g"><span>Total $ (' + priced + ' priced line' + (priced === 1 ? '' : 's') + ')</span><span>' + G.fmtMoney(money) + '</span></div>';
     if (missing) th += '<p style="color:#c0392b">' + missing + ' item(s) need a scale on their page.</p>';
     $('totals').innerHTML = th;
   }
