@@ -86,10 +86,21 @@
     const adj = +item.adjust || 0;
     const shapes = (item.shapes || []).map(s => s.pts || s);
     if (!ftPerPt) return out;
-    if (G.isArea(item.type)) {
+    if (item.type === 'roof') {
+      // each roof section has its own pitch: sloped = plan area x that section's pitch factor
+      out.sections = (item.shapes || []).map(sh => {
+        const pts = sh.pts || sh, pitch = G.sectionPitch(item, sh), f = G.pitchFactor(pitch);
+        const flat = G.polygonArea(pts) * ftPerPt * ftPerPt;
+        return { pitch, factor: f, flat, sloped: flat * f };
+      });
+      out.flat = out.sections.reduce((a, x) => a + x.flat, 0);
+      out.sloped = out.sections.reduce((a, x) => a + x.sloped, 0);
+      out.factor = out.flat ? out.sloped / out.flat : G.pitchFactor(item.pitch);
+      out.sf = out.sloped * qty + adj;
+    } else if (G.isArea(item.type)) {
       let a = 0; shapes.forEach(p => { a += G.polygonArea(p); });
       out.flat = a * ftPerPt * ftPerPt;
-      out.factor = item.type === 'roof' ? G.pitchFactor(item.pitch) : 1;
+      out.factor = 1;
       out.sf = out.flat * out.factor * qty + adj;
     } else {
       let L = 0; shapes.forEach(p => { L += G.polylineLength(p); });
@@ -97,6 +108,15 @@
       out.sf = out.lf * (+item.height || 0) * qty + adj;
     }
     return out;
+  };
+
+  /* pitch of one roof section (older files kept one pitch on the whole roof line) */
+  G.sectionPitch = (item, sh) => (sh && !Array.isArray(sh) && sh.pitch !== undefined && sh.pitch !== null && sh.pitch !== '') ? +sh.pitch : (+item.pitch || 0);
+  /* roof pitches used, e.g. "6/12, 8/12" */
+  G.roofPitchText = item => {
+    const ps = []; (item.shapes || []).forEach(sh => { if ((sh.pts || sh).length) { const p = G.sectionPitch(item, sh); if (ps.indexOf(p) < 0) ps.push(p); } });
+    if (!ps.length) ps.push(+item.pitch || 0);
+    return ps.map(p => p + '/12').join(', ');
   };
 
   G.itemPrice = it => { const p = it && it.price; return (p === null || p === undefined || p === '' || isNaN(+p)) ? null : +p; };
@@ -119,11 +139,21 @@
         proj.jobName || '', i + 1, it.name, G.TYPE_LABELS[it.type] || it.type, it.page, sc ? sc.label : 'NOT SET',
         c.lf === null ? '' : c.lf.toFixed(1),
         G.isLength(it.type) ? G.fmtFtIn(+it.height || 0) : '',
-        it.type === 'roof' ? (it.pitch || 0) + '/12' : '',
+        it.type === 'roof' ? G.roofPitchText(it) : '',
         c.flat === null ? '' : Math.round(c.flat),
         it.qty === undefined || it.qty === '' ? 1 : it.qty, +it.adjust || 0, sf,
         G.itemPrice(it) === null ? '' : G.itemPrice(it).toFixed(2), lt === null ? '' : lt.toFixed(2)
       ]);
+      // roof: one row per section with its own pitch (not counted again in the totals)
+      if (it.type === 'roof' && c.sections && it.shapes.filter(sh => (sh.pts || sh).length).length > 1) {
+        let k = 0;
+        it.shapes.forEach((sh, si) => {
+          if (!(sh.pts || sh).length) return; k++;
+          const x = c.sections[si];
+          rows.push([proj.jobName || '', (i + 1) + '.' + k, '  ' + it.name + ' – section ' + k, 'Roof section', it.page, sc ? sc.label : 'NOT SET', '', '',
+            x.pitch + '/12', Math.round(x.flat), '', '', Math.round(x.sloped), '', '']);
+        });
+      }
     });
     rows.push([]);
     rows.push(['', '', 'TOTALS BY TYPE']);

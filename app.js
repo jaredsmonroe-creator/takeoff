@@ -3,7 +3,7 @@
   'use strict';
   const G = window.TakeoffGeom;
   const $ = id => document.getElementById(id);
-  const APP_VERSION = '1.6.1';
+  const APP_VERSION = '1.7.0';
   pdfjsLib.GlobalWorkerOptions.workerSrc = 'vendor/pdf.worker.min.js';
 
   const COLORS = ['#d62728', '#1f77b4', '#2ca02c', '#9467bd', '#ff7f0e', '#8c564b', '#e377c2', '#17becf', '#bcbd22', '#7f7f7f', '#393b79', '#e7298a'];
@@ -22,7 +22,7 @@
     view: { s: 1, tx: 0, ty: 0 },
     proj: newProject(),
     activeId: null, tool: null, toolPts: [], ortho: false,
-    renderTask: null, detailTask: null, detailTimer: 0, panelOpen: true, selPt: null, hist: []
+    renderTask: null, detailTask: null, detailTimer: 0, panelOpen: true, selPt: null, hist: [], undo: [], redo: [], lastState: null, hlSec: null
   };
   window.__S = S; // for testing / debugging
 
@@ -34,7 +34,58 @@
   const LP_KEY = 'takeoff_lastPrices';
   function lastPrices() { try { return JSON.parse(localStorage.getItem(LP_KEY) || '{}') || {}; } catch (e) { return {}; } }
   function setLastPrice(type, v) { try { const m = lastPrices(); if (v === null) delete m[type]; else m[type] = v; localStorage.setItem(LP_KEY, JSON.stringify(m)); } catch (e) { } }
-  function autosave() { clearTimeout(saveTimer); saveTimer = setTimeout(() => { try { S.proj.updated = new Date().toISOString(); localStorage.setItem(LS_KEY, JSON.stringify(S.proj)); } catch (e) { console.warn(e); } }, 300); }
+  /* ---------------- undo / redo: whole-project snapshots ----------------
+     Every change ends in autosave(), so autosave records the state before it. */
+  const HIST_MAX = 150;
+  function projState() { return JSON.stringify(S.proj, (k, v) => k === 'updated' ? undefined : v); }
+  function normalizeProj(p) {
+    (p.items || []).forEach(it => {
+      if (it.type !== 'roof') return;
+      if (it.pitch === undefined || it.pitch === null || it.pitch === '') it.pitch = 0;
+      (it.shapes || []).forEach(sh => { if (sh.pitch === undefined || sh.pitch === null || sh.pitch === '') sh.pitch = +it.pitch || 0; });
+    });
+    return p;
+  }
+  /* older saves: one pitch on the whole roof line -> each section gets that pitch; plain "Roof" -> "Main Roof" */
+  function migrateProj(p) {
+    normalizeProj(p);
+    (p.items || []).forEach(it => { if (it.type === 'roof' && it.name === 'Roof') it.name = 'Main Roof'; });
+    return p;
+  }
+  function commit() {
+    normalizeProj(S.proj);
+    const cur = projState();
+    if (S.lastState !== null && cur !== S.lastState) {
+      S.undo.push(S.lastState); if (S.undo.length > HIST_MAX) S.undo.shift();
+      S.redo = [];
+    }
+    S.lastState = cur; updateHistBtns();
+  }
+  function resetHistory() { normalizeProj(S.proj); S.undo = []; S.redo = []; S.lastState = projState(); updateHistBtns(); }
+  function applyState(str) {
+    const upd = S.proj.updated;
+    S.proj = Object.assign(newProject(), JSON.parse(str)); S.proj.updated = upd;
+    S.lastState = str; S.selPt = null; S.hlSec = null;
+    if (S.activeId !== null && !S.proj.items.some(i => i.id === S.activeId)) S.activeId = null;
+    clearTimeout(saveTimer); saveTimer = setTimeout(() => { try { S.proj.updated = new Date().toISOString(); localStorage.setItem(LS_KEY, JSON.stringify(S.proj)); } catch (e) { } }, 300);
+    $('jobName').value = S.proj.jobName || '';
+    renderPanel(); drawOverlay(); updatePageUI(); updateHud(); updateHistBtns();
+  }
+  function canUndo() { return !!(S.tool ? S.toolPts.length : 0) || S.undo.length > 0; }
+  function doUndo() {
+    if (S.tool && S.toolPts.length) { S.toolPts.pop(); drawOverlay(); updateHud(); updateHistBtns(); return; }
+    if (!S.undo.length) { toast('Nothing to undo'); return; }
+    S.redo.push(S.lastState); applyState(S.undo.pop()); toast('↶ Undone', 1200);
+  }
+  function doRedo() {
+    if (!S.redo.length) { toast('Nothing to redo'); return; }
+    S.undo.push(S.lastState); applyState(S.redo.pop()); toast('↷ Redone', 1200);
+  }
+  function updateHistBtns() {
+    const u = $('btnUndo'), r = $('btnRedo'); if (!u || !r) return;
+    u.disabled = !canUndo(); r.disabled = !S.redo.length;
+  }
+  function autosave() { commit(); clearTimeout(saveTimer); saveTimer = setTimeout(() => { try { S.proj.updated = new Date().toISOString(); localStorage.setItem(LS_KEY, JSON.stringify(S.proj)); } catch (e) { console.warn(e); } }, 300); }
   function idb() {
     return new Promise((res, rej) => { const r = indexedDB.open('epicTakeoff', 1); r.onupgradeneeded = () => r.result.createObjectStore('files'); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); });
   }
@@ -66,6 +117,7 @@
     }
     $('jobName').value = S.proj.jobName || '';
     $('empty').style.display = 'none';
+    if (!S.proj.items.length) resetHistory(); // opening a plan on an empty job is not an undo step
     autosave();
     await showPage(Math.min(S.pageNum || 1, S.pageCount));
   }
@@ -299,7 +351,7 @@
     S.selPt = { id: h.item.id, si: h.si, idx: h.insertAt };
     return arr;
   }
-  function snapshot(it) { S.hist.push({ id: it.id, shapes: JSON.stringify(it.shapes) }); if (S.hist.length > 200) S.hist.shift(); }
+  function snapshot(it) { /* undo is now whole-project (see commit/autosave) */ }
   function validSel() {
     const sp = S.selPt, it = activeItem();
     if (!sp || !it || sp.id !== it.id || it.page !== S.pageNum || !it.shapes[sp.si] || !it.shapes[sp.si].pts[sp.idx]) return null;
@@ -325,7 +377,7 @@
     if (S.tool) {
       if (S.toolPts.length >= 2) S.toolPts = [];
       S.toolPts.push(snapOrtho(S.toolPts[S.toolPts.length - 1], pt));
-      drawOverlay(); updateHud();
+      drawOverlay(); updateHud(); updateHistBtns();
       if (S.tool === 'calibrate' && S.toolPts.length === 2) setTimeout(askCalibrationLength, 150);
       return;
     }
@@ -338,7 +390,7 @@
     if (!scaleOf(S.pageNum)) toast('Scale not set on this page yet – tap 📏 Set Scale', 2500);
     snapshot(it); S.selPt = null; updateHud();
     let sh = it.shapes[it.shapes.length - 1];
-    if (!sh || sh.closed) { sh = { pts: [], closed: false }; it.shapes.push(sh); }
+    if (!sh || sh.closed) { sh = { pts: [], closed: false }; if (it.type === 'roof') sh.pitch = +it.pitch || 0; it.shapes.push(sh); }
     // tap on the first point: closes an area shape / snaps a wall run closed
     if (sh.pts.length >= (G.isArea(it.type) ? 3 : 2) && screenDist(sh.pts[0], cx, cy) < 20) {
       if (!G.isArea(it.type)) { sh.pts.push(sh.pts[0].slice()); sh.autoPt = true; }
@@ -459,14 +511,19 @@
   }
 
   /* ---------------- items ---------------- */
-  function addItem(type) {
+  function addItem(type, opts) {
     if (!S.pdf) { toast('Open a plan first'); return; }
+    if (type === 'roof' && !opts) { finishTool(); roofDialog(); return; }
     finishTool();
     const count = S.proj.items.filter(i => i.type === type).length + 1;
     const it = { id: S.proj.nextId++, type, name: G.TYPE_LABELS[type] + (count > 1 ? ' ' + count : ''), page: S.pageNum, shapes: [], qty: 1, adjust: 0, price: (lastPrices()[type] !== undefined ? lastPrices()[type] : null), color: TYPE_COLOR[type] };
     // vary color within same type
     if (count > 1) it.color = COLORS[(S.proj.nextId + 3) % COLORS.length];
-    if (type === 'roof') it.pitch = S.proj.lastPitch !== undefined ? S.proj.lastPitch : 6;
+    if (type === 'roof') {
+      it.pitch = opts && opts.pitch !== undefined ? +opts.pitch : (S.proj.lastPitch !== undefined ? S.proj.lastPitch : 6);
+      S.proj.lastPitch = it.pitch;
+      if (opts && opts.name) it.name = opts.name;
+    }
     if (G.isLength(type)) {
       it.floor = DEFAULT_FLOOR[type];
       it.height = S.proj.lastHeights[it.floor] !== undefined ? S.proj.lastHeights[it.floor] : DEFAULT_HEIGHT[it.floor];
@@ -475,6 +532,7 @@
     S.proj.items.push(it); S.activeId = it.id; S.selPt = null;
     autosave(); renderPanel(); drawOverlay();
     if (!S.panelOpen) togglePanel(true);
+    if (type === 'roof') { toast('"' + it.name + '" section 1 at ' + it.pitch + '/12 – tap each corner, tap the first point to close. ＋ Section for another pitch.', 3500); return; }
     toast(G.isArea(type) ? 'Tap each corner. Tap the first point to close.' : 'Tap along the wall. Use "New run" for a separate wall.', 2800);
   }
   function deleteItem(id) {
@@ -484,29 +542,76 @@
     if (S.activeId === id) S.activeId = null;
     autosave(); renderPanel(); drawOverlay();
   }
-  function undoPoint() {
-    if (S.tool) { S.toolPts.pop(); drawOverlay(); updateHud(); return; }
-    const it = activeItem(); if (!it) return;
-    S.selPt = null;
-    for (let i = S.hist.length - 1; i >= 0; i--) {
-      if (S.hist[i].id === it.id) { it.shapes = JSON.parse(S.hist[i].shapes); S.hist.splice(i, 1); autosave(); drawOverlay(); renderPanel(); updateHud(); return; }
-    }
-    let sh = it.shapes[it.shapes.length - 1];
-    if (!sh) return;
-    if (sh.closed) { sh.closed = false; if (sh.autoPt) { sh.pts.pop(); sh.autoPt = false; } } else sh.pts.pop();
-    if (!sh.pts.length) it.shapes.pop();
-    autosave(); drawOverlay(); renderPanel();
-  }
+  function undoPoint() { doUndo(); }
   function newSection() {
     const it = activeItem(); if (!it) return;
+    if (it.type === 'roof') { pitchDialog('New section on "' + it.name + '"', it.pitch, p => roofNewSection(it, p)); return; }
     const sh = it.shapes[it.shapes.length - 1];
     if (sh && sh.pts.length && !sh.closed) { snapshot(it); sh.closed = true; }
     toast(G.isArea(it.type) ? 'Tap corners of the next section' : 'Tap the start of the next wall run');
-    drawOverlay(); renderPanel();
+    autosave(); drawOverlay(); renderPanel();
+  }
+  /* roof: close the section being drawn and start a new one with its own pitch */
+  function roofNewSection(it, pitch) {
+    pitch = +pitch || 0;
+    const sh = it.shapes[it.shapes.length - 1];
+    if (sh && !sh.pts.length) sh.pitch = pitch; // empty section waiting for taps: just change its pitch
+    else { if (sh && !sh.closed) sh.closed = true; it.shapes.push({ pts: [], closed: false, pitch }); }
+    it.pitch = pitch; S.proj.lastPitch = pitch; S.activeId = it.id; S.selPt = null;
+    if (it.page !== S.pageNum && !it.shapes.some(x => x.pts.length)) it.page = S.pageNum;
+    autosave(); drawOverlay(); renderPanel(); updateHud();
+    toast('Section ' + it.shapes.length + ' at ' + pitch + '/12 – tap its corners, tap the first point to close.', 3000);
+  }
+  function pitchDialog(title, cur, cb) {
+    let html = '<h3>' + esc(title) + '</h3><p>Pick the pitch for this section:</p><div class="grid pitchgrid">';
+    for (let p = 0; p <= 16; p++) html += '<button data-pp="' + p + '" class="' + (+cur === p ? 'sel' : '') + '">' + p + '/12' + (p === 0 ? '<br><small>flat</small>' : '') + '</button>';
+    html += '</div><div class="actions"><button id="ppCancel">Cancel</button><button id="ppOk" class="primary">Use ' + (+cur || 0) + '/12</button></div>';
+    modal(html);
+    $('ppCancel').onclick = closeModal;
+    $('ppOk').onclick = () => { closeModal(); cb(+cur || 0); };
+    $('modalbox').querySelectorAll('[data-pp]').forEach(b => b.onclick = () => { closeModal(); cb(+b.dataset.pp); });
+  }
+  function roofDialog() {
+    const n = S.proj.items.filter(i => i.type === 'roof').length;
+    const def = n ? 'Garage Roof' : 'Main Roof';
+    let cur = S.proj.lastPitch !== undefined ? S.proj.lastPitch : 6;
+    let html = '<h3>Add a roof</h3><p>Name this roof (each roof gets its own list of sections):</p>' +
+      '<input id="rfName" autocomplete="off" value="' + esc(def) + '">' +
+      '<div class="quick">' + ['Main Roof', 'Main House', 'Garage Roof', 'Addition', 'Bonus Room'].map(q => '<button data-rq="' + esc(q) + '">' + esc(q) + '</button>').join('') + '</div>' +
+      '<p>Pitch of the first section:</p><div class="grid pitchgrid">';
+    for (let p = 0; p <= 16; p++) html += '<button data-rp="' + p + '" class="' + (cur === p ? 'sel' : '') + '">' + p + '/12' + (p === 0 ? '<br><small>flat</small>' : '') + '</button>';
+    html += '</div><div class="actions"><button id="rfCancel">Cancel</button><button id="rfOk" class="primary">Add roof</button></div>';
+    modal(html);
+    const inp = $('rfName'); setTimeout(() => { inp.focus(); inp.select(); }, 50);
+    $('modalbox').querySelectorAll('[data-rq]').forEach(b => b.onclick = () => { inp.value = b.dataset.rq; });
+    $('modalbox').querySelectorAll('[data-rp]').forEach(b => b.onclick = () => { cur = +b.dataset.rp; $('modalbox').querySelectorAll('[data-rp]').forEach(x => x.classList.toggle('sel', x === b)); });
+    $('rfCancel').onclick = closeModal;
+    $('rfOk').onclick = () => { const name = inp.value.trim() || def; closeModal(); addItem('roof', { name, pitch: cur }); };
+  }
+  function deleteSection(it, si) {
+    if (!it || !it.shapes[si]) return;
+    if (it.shapes[si].pts.length >= 3 && !confirm('Delete section ' + (si + 1) + ' of "' + it.name + '"?')) return;
+    it.shapes.splice(si, 1); S.selPt = null; S.hlSec = null;
+    autosave(); renderPanel(); drawOverlay(); updateHud();
+  }
+  function setSectionPitch(it, si, p) {
+    const sh = it && it.shapes[si]; if (!sh) return;
+    sh.pitch = +p || 0; S.proj.lastPitch = sh.pitch;
+    if (si === it.shapes.length - 1) it.pitch = sh.pitch;
+    changed();
+  }
+  function highlightSection(it, si) {
+    const sh = it && it.shapes[si]; if (!sh || !sh.pts.length) return;
+    const same = S.hlSec && S.hlSec.id === it.id && S.hlSec.si === si;
+    S.hlSec = same ? null : { id: it.id, si };
+    if (!same && it.page !== S.pageNum) showPage(it.page).then(() => { zoomToPts(sh.pts); renderPanel(); });
+    else if (!same) zoomToPts(sh.pts); else drawOverlay();
+    renderPanel();
+    if (!same) { const c = calc(it), x = c.sections && c.sections[si]; if (x) toast(it.name + ' · section ' + (si + 1) + ' · ' + x.pitch + '/12: flat ' + Math.round(x.flat).toLocaleString() + ' sf → sloped ' + Math.round(x.sloped).toLocaleString() + ' sf', 4000); }
   }
   function selectItem(id) {
     finishTool();
-    S.activeId = S.activeId === id ? null : id; S.selPt = null;
+    S.activeId = S.activeId === id ? null : id; S.selPt = null; S.hlSec = null;
     const it = activeItem();
     if (it && it.page !== S.pageNum && it.shapes.length) showPage(it.page);
     renderPanel(); drawOverlay();
@@ -527,7 +632,9 @@
         const pts = sh.pts; if (!pts.length) return;
         const ps = pts.map(p => p[0].toFixed(2) + ',' + p[1].toFixed(2)).join(' ');
         if (G.isArea(it.type)) {
-          if (pts.length >= 3) g.appendChild(svgEl('polygon', { points: ps, fill: it.color, 'fill-opacity': active ? 0.28 : 0.18, stroke: it.color, 'stroke-width': active ? 3 : 2, 'vector-effect': 'non-scaling-stroke', 'stroke-dasharray': sh.closed ? '' : '8 4' }));
+          const hl = S.hlSec && S.hlSec.id === it.id && S.hlSec.si === si;
+          if (pts.length >= 3) g.appendChild(svgEl('polygon', { points: ps, fill: hl ? '#ffd84d' : it.color, 'fill-opacity': hl ? 0.55 : active ? 0.28 : 0.18, stroke: hl ? '#ff9500' : it.color, 'stroke-width': hl ? 6 : active ? 3 : 2, 'vector-effect': 'non-scaling-stroke', 'stroke-dasharray': sh.closed ? '' : '8 4', class: hl ? 'sechl' : '' }));
+          if (it.type === 'roof' && pts.length >= 3 && it.shapes.length > 1) { const cc = G.centroid(pts); g.appendChild(svgEl('text', { x: cc[0], y: cc[1] + 18 * k, 'font-size': 12 * k, fill: it.color, 'text-anchor': 'middle', 'stroke-width': 3 * k }, 'S' + (si + 1) + ' ' + G.sectionPitch(it, sh) + '/12')); }
           else g.appendChild(svgEl('polyline', { points: ps, fill: 'none', stroke: it.color, 'stroke-width': 3, 'vector-effect': 'non-scaling-stroke' }));
         } else {
           g.appendChild(svgEl('polyline', { points: ps, fill: 'none', stroke: it.color, 'stroke-width': active ? 5 : 4, 'stroke-opacity': 0.85, 'stroke-linejoin': 'round', 'stroke-linecap': 'round', 'vector-effect': 'non-scaling-stroke' }));
@@ -597,11 +704,11 @@
   function startTool(t) {
     if (!S.pdf) { toast('Open a plan first'); return; }
     if (S.tool === t) { finishTool(); return; }
-    S.tool = t; S.toolPts = []; S.activeId = null;
+    S.tool = t; S.toolPts = []; S.activeId = null; setTimeout(updateHistBtns, 0);
     $('btnRuler').classList.toggle('on', t === 'measure');
     updateHud(); drawOverlay(); renderPanel();
   }
-  function finishTool() { S.tool = null; S.toolPts = []; $('btnRuler').classList.remove('on'); updateHud(); drawOverlay(); }
+  function finishTool() { S.tool = null; S.toolPts = []; updateHistBtns(); $('btnRuler').classList.remove('on'); updateHud(); drawOverlay(); }
 
   /* ---------------- modals ---------------- */
   function modal(html) { $('modalbox').innerHTML = html; $('modal').classList.remove('hidden'); }
@@ -689,7 +796,9 @@
       '<li><b>📏 Set Scale</b> → pick the scale printed on the sheet, or <b>Calibrate</b>: zoom in, tap both ends of a long dimension, type its length.</li>' +
       '<li><b>📐 Check</b> → tap both ends of another printed dimension. If it matches, you\'re good.</li>' +
       '<li>Tap <b>+ Roof</b> (pick the pitch), <b>+ Walls</b> (pick the floor and wall height), <b>+ Garage Ceiling</b>, etc.</li>' +
-      '<li>Tap the corners on the plan. For areas, tap the first point to close it. <b>New section</b> adds another piece to the same line. <b>↶ Undo</b> removes the last point. Drag a white dot to fix it.</li>' +
+      '<li>Tap the corners on the plan. For areas, tap the first point to close it. <b>New section</b> adds another piece to the same line. Drag a white dot to fix it.</li>' +
+      '<li><b>↶ Undo / ↷ Redo</b> (top bar): Undo takes back the last thing you did – a point, a closed or deleted section, a pitch, scale, height, name or price change, an Auto Trace, a deleted line. Redo puts it back. Doing something new clears Redo. Keyboard: ⌘Z / ⇧⌘Z.</li>' +
+      '<li><b>Roofs with several pitches:</b> tap <b>+ Roof</b>, name it (Main House, Garage Roof…) and pick the first pitch. Trace that section. Tap <b>＋ Section</b> on the roof card, pick the next pitch and trace it – each roof keeps its own list of sections. Each section has its own pitch dropdown you can change any time; its sloped sf = flat sf × pitch factor, and the roof total adds up all its sections. Tap a section number to show it on the plan. <b>All roofs</b> in the totals adds every roof.</li>' +
       '<li><b>Jogs / bump-outs:</b> press and hold anywhere on a line (about half a second) until it pulses, then drag without lifting – a new corner follows your finger. Or tap/drag the <b>+</b> in the middle of a line. To remove a point, press and hold it, then tap <b>🗑 Delete point</b>. Undo works for all of these.</li>' +
       '<li><b>✨ Auto Trace</b> (CAD/vector PDFs, not scans): add a line (Walls, Roof, Garage…) and tap <b>Auto Trace this page</b>. It draws ONE loop around the outside of the exterior walls – garage included – and zooms to it with the LF shown at the top. Move points to take out the garage or porches. Sheet with several plans? Zoom in on the one you want, or tap one spot inside it first. It skips schedules, notes and the title block. Shrunk printouts (11×17): calibrate the scale first. Undo puts it back.</li>' +
       '<li><b>✨ Roof by pitch</b>: on the roof plan page add a Roof line, pick its pitch (e.g. 8/12), then Auto Trace. It traces only the roof faces labelled with that pitch (8:12, 8/12, 7"/12" or a pitch triangle) – one section per area – and skips faces you already put in another Roof line on that page, so do one Roof line per pitch. If it finds no matching label it traces the whole roof outline and says so. Pitch 0/12 (flat / none) = whole outline. Porch roofs get a ⚠ note; always check the faces against the plan.</li>' +
@@ -718,7 +827,7 @@
 
   /* ---------------- panel ---------------- */
   function togglePanel(force) { S.panelOpen = force !== undefined ? force : !S.panelOpen; $('panel').classList.toggle('hidden', !S.panelOpen); setTimeout(() => { if (S.pdf) { applyView(); scheduleDetail(); } }, 50); }
-  function pitchOptions(sel) { let o = ''; for (let p = 0; p <= 16; p++) o += '<option value="' + p + '"' + (+sel === p ? ' selected' : '') + '>' + p + '/12' + (p === 0 ? ' (flat / none)' : '') + '</option>'; return o; }
+  function pitchOptions(sel, short) { let o = ''; for (let p = 0; p <= 16; p++) o += '<option value="' + p + '"' + (+sel === p ? ' selected' : '') + '>' + p + '/12' + (p === 0 ? (short ? ' flat' : ' (flat / none)') : '') + '</option>'; return o; }
   function floorOptions(sel) { return FLOORS.map(f => '<option' + (f === sel ? ' selected' : '') + '>' + f + '</option>').join(''); }
 
   function renderEditor() {
@@ -729,7 +838,11 @@
     let h = '<div class="card" style="border-color:' + it.color + '">';
     h += '<div class="row"><input class="name" id="edName" value="' + esc(it.name) + '"></div>';
     h += '<div class="row sub">' + esc(G.TYPE_LABELS[it.type]) + ' · page ' + it.page + (scaleOf(it.page) ? '' : ' · <b style="color:#c0392b">SCALE NOT SET</b>') + '</div>';
-    if (it.type === 'roof') h += '<div class="row"><label>Pitch</label><select id="edPitch">' + pitchOptions(it.pitch) + '</select><span class="sub">× ' + G.pitchFactor(it.pitch).toFixed(3) + '</span></div>';
+    if (it.type === 'roof') {
+      const nsec = it.shapes.filter(x => x.pts.length).length;
+      const lastSh = it.shapes[it.shapes.length - 1];
+      h += '<div class="row"><label>' + (lastSh && lastSh.pts.length >= 3 ? 'Pick pitch → new section' : 'Pitch') + '</label><select id="edPitch">' + pitchOptions(it.pitch) + '</select><span class="sub">× ' + G.pitchFactor(it.pitch).toFixed(3) + '</span></div>';
+    }
     if (G.isLength(it.type)) {
       h += '<div class="row"><label>Floor</label><select id="edFloor">' + floorOptions(it.floor) + '</select>';
       h += '<label>Height</label><input id="edHeight" class="short" value="' + esc(G.fmtFtIn(+it.height, 4).replace(/ 0"$/, '')) + '" inputmode="text"></div>';
@@ -744,7 +857,13 @@
     h += '</div>';
     ed.innerHTML = h;
     $('edName').onchange = e => { it.name = e.target.value.trim() || it.name; autosave(); renderList(); drawOverlay(); };
-    if ($('edPitch')) $('edPitch').onchange = e => { it.pitch = +e.target.value; S.proj.lastPitch = it.pitch; changed(); };
+    if ($('edPitch')) $('edPitch').onchange = e => {
+      // picking a new pitch on a roof that already has a finished section starts a NEW section at that pitch
+      const p = +e.target.value, last = it.shapes[it.shapes.length - 1];
+      if (last && last.pts.length >= 3) { roofNewSection(it, p); return; }
+      if (last) last.pitch = p; // empty or barely started section: just change its pitch
+      it.pitch = p; S.proj.lastPitch = p; changed();
+    };
     if ($('edFloor')) $('edFloor').onchange = e => {
       const oldAuto = it.name.match(/^(Main|Second|Third|Bonus|Knee wall|Basement|Garage|Other) walls/);
       it.floor = e.target.value;
@@ -758,18 +877,51 @@
     $('edPrice').onchange = e => { const s = e.target.value.replace(/[$,\s]/g, ''); const v = s === '' ? null : parseFloat(s); if (s !== '' && (isNaN(v) || v < 0)) { toast('Type a price like 1.84'); setTimeout(renderEditor, 0); return; } it.price = v; setLastPrice(it.type, v); setTimeout(changed, 0); };
     $('edUndo').onclick = undoPoint; $('edSec').onclick = newSection;
     $('edAuto').onclick = () => autoTrace(it);
-    $('edDone').onclick = () => { const sh = it.shapes[it.shapes.length - 1]; if (sh) sh.closed = true; S.activeId = null; S.selPt = null; updateHud(); autosave(); renderPanel(); drawOverlay(); };
+    $('edDone').onclick = () => { const sh = it.shapes[it.shapes.length - 1]; if (sh && !sh.pts.length) it.shapes.pop(); else if (sh) sh.closed = true; S.activeId = null; S.selPt = null; updateHud(); autosave(); renderPanel(); drawOverlay(); };
     $('edDel').onclick = () => deleteItem(it.id);
     $('edDelPt').onclick = deletePoint;
+    wireSections(ed);
+  }
+  /* roof sections table: each section has its own pitch dropdown, flat sf and sloped sf */
+  function sectionsHtml(it, c, where) {
+    const rows = it.shapes.map((sh, si) => {
+      const x = c.sections ? c.sections[si] : null, pitch = G.sectionPitch(it, sh);
+      const hl = S.hlSec && S.hlSec.id === it.id && S.hlSec.si === si;
+      const drawing = !sh.closed && it.id === S.activeId && si === it.shapes.length - 1;
+      return '<div class="sec' + (hl ? ' hl' : '') + '" data-sec="' + it.id + ':' + si + '" data-sechl="' + it.id + ':' + si + '">' +
+        '<button class="secn" data-sechl="' + it.id + ':' + si + '" title="Show on plan">' + (si + 1) + '</button>' +
+        '<select data-secpitch="' + it.id + ':' + si + '" aria-label="Section ' + (si + 1) + ' pitch">' + pitchOptions(pitch, true) + '</select>' +
+        '<span class="secv"><small>flat</small> ' + (x && sh.pts.length >= 3 ? Math.round(x.flat).toLocaleString() : (sh.pts.length ? '…' : '—')) + '</span>' +
+        '<span class="secv"><small>sloped</small> <b>' + (x && sh.pts.length >= 3 ? Math.round(x.sloped).toLocaleString() : '—') + '</b></span>' +
+        '<button class="secdel" data-secdel="' + it.id + ':' + si + '" title="Delete section">🗑</button>' +
+        (drawing ? '<div class="sechint">' + (sh.pts.length ? 'drawing… tap the first point to close' : 'tap its corners on the plan') + '</div>' : '') +
+        '</div>';
+    }).join('');
+    return '<div class="secs" data-where="' + where + '">' + (rows || '<div class="sechint">No sections yet – tap corners on the plan.</div>') +
+      '<button class="secadd" data-secadd="' + it.id + '">＋ Section (new pitch)</button></div>';
+  }
+  function wireSections(root) {
+    const get = v => { const [id, si] = v.split(':').map(Number); return [S.proj.items.find(i => i.id === id), si]; };
+    root.querySelectorAll('[data-secpitch]').forEach(el => { el.onclick = e => e.stopPropagation(); el.onchange = e => { const [it, si] = get(el.dataset.secpitch); setSectionPitch(it, si, +e.target.value); }; });
+    root.querySelectorAll('[data-secdel]').forEach(el => el.onclick = e => { e.stopPropagation(); const [it, si] = get(el.dataset.secdel); deleteSection(it, si); });
+    root.querySelectorAll('[data-sechl]').forEach(el => el.onclick = e => { e.stopPropagation(); const [it, si] = get(el.dataset.sechl); highlightSection(it, si); });
+    root.querySelectorAll('[data-secadd]').forEach(el => el.onclick = e => {
+      e.stopPropagation(); const it = S.proj.items.find(i => i.id === +el.dataset.secadd); if (!it) return;
+      finishTool();
+      if (S.activeId !== it.id) { S.activeId = it.id; S.selPt = null; if (it.page !== S.pageNum && it.shapes.some(x => x.pts.length)) showPage(it.page); }
+      pitchDialog('New section on "' + it.name + '"', it.pitch, p => roofNewSection(it, p));
+    });
+    root.querySelectorAll('.secs').forEach(el => el.onclick = e => e.stopPropagation());
   }
   function subText(it, c) {
     if (c.noScale) return 'set the scale to see sf';
     const n = it.shapes.filter(s => s.pts.length).length;
-    if (G.isArea(it.type)) return 'flat ' + Math.round(c.flat).toLocaleString() + ' sf' + (it.type === 'roof' ? ' · ' + (it.pitch || 0) + '/12' : '') + ' · ' + n + ' section' + (n === 1 ? '' : 's');
+    if (G.isArea(it.type)) return 'flat ' + Math.round(c.flat).toLocaleString() + ' sf' + (it.type === 'roof' ? ' · ' + G.roofPitchText(it) : '') + ' · ' + n + ' section' + (n === 1 ? '' : 's');
     return c.lf.toFixed(1) + ' LF × ' + G.fmtFtIn(+it.height, 4).replace(/ 0"$/, '') + ' · ' + n + ' run' + (n === 1 ? '' : 's');
   }
   function changed() { autosave(); renderPanel(); drawOverlay(); }
-  function refreshPanelLive() { const it = activeItem(); if (!it || !$('edSF')) return; const c = calc(it); $('edSF').textContent = fmtSF(c.sf); $('edSub').textContent = subText(it, c); const lt = G.lineTotal(it, c.sf); if ($('edMoney')) $('edMoney').textContent = lt === null ? '' : '= ' + G.fmtMoney(lt); }
+  function refreshPanelLive() { const it = activeItem(); if (!it || !$('edSF')) return;
+    if (it.type === 'roof') { const c0 = calc(it); document.querySelectorAll('.secs').forEach(box => { const card = box.closest('[data-id]'); if (box.dataset.where === 'ed' || (card && +card.dataset.id === it.id)) { const tmp = document.createElement('div'); tmp.innerHTML = sectionsHtml(it, c0, box.dataset.where); box.replaceWith(tmp.firstChild); } }); wireSections($('panel')); } const c = calc(it); $('edSF').textContent = fmtSF(c.sf); $('edSub').textContent = subText(it, c); const lt = G.lineTotal(it, c.sf); if ($('edMoney')) $('edMoney').textContent = lt === null ? '' : '= ' + G.fmtMoney(lt); }
 
   function renderList() {
     const L = $('list');
@@ -779,16 +931,17 @@
       const c = calc(it);
       if (c.sf !== null) { tot[it.type] = (tot[it.type] || 0) + c.sf; grand += c.sf; } else if (it.shapes.length) missing++;
       let det = G.TYPE_LABELS[it.type] + ' · p' + it.page;
-      if (it.type === 'roof') det += ' · ' + (it.pitch || 0) + '/12';
+      if (it.type === 'roof') det += ' · ' + G.roofPitchText(it);
       if (G.isLength(it.type)) det += ' · ' + (c.lf === null ? '—' : c.lf.toFixed(1)) + ' LF × ' + G.fmtFtIn(+it.height).replace(/ 0"$/, '');
       else if (c.flat !== null) det += ' · flat ' + Math.round(c.flat);
       const lt = G.lineTotal(it, c.sf); if (lt !== null) { money += lt; priced++; totM[it.type] = (totM[it.type] || 0) + lt; det += ' · $' + G.itemPrice(it) + '/sf = ' + G.fmtMoney(lt); }
-      return '<div class="item' + (it.id === S.activeId ? ' active' : '') + '" data-id="' + it.id + '"><span class="sw" style="background:' + it.color + '"></span><span class="nm"><b>' + esc(it.name) + '</b><small>' + esc(det) + '</small></span><span class="val">' + fmtSF(c.sf) + '</span></div>';
+      return '<div class="item' + (it.id === S.activeId ? ' active' : '') + '" data-id="' + it.id + '"><span class="sw" style="background:' + it.color + '"></span><span class="nm"><b>' + esc(it.name) + '</b><small>' + esc(det) + '</small></span><span class="val">' + fmtSF(c.sf) + '</span>' + (it.type === 'roof' && !c.noScale ? sectionsHtml(it, c, 'list') : '') + '</div>';
     }).join('');
     L.querySelectorAll('.item').forEach(el => el.onclick = () => selectItem(+el.dataset.id));
+    wireSections(L);
     const m = v => v === undefined ? '—' : G.fmtMoney(v);
     let th = '<div class="t h"><span></span><span>SF</span><span>Price</span></div>';
-    th += Object.keys(G.TYPE_LABELS).filter(t => tot[t] !== undefined).map(t => '<div class="t"><span>' + G.TYPE_LABELS[t] + '</span><b>' + fmtSF(tot[t]) + '</b><b>' + m(totM[t]) + '</b></div>').join('');
+    th += Object.keys(G.TYPE_LABELS).filter(t => tot[t] !== undefined).map(t => '<div class="t"><span>' + (t === 'roof' ? 'All roofs' : G.TYPE_LABELS[t]) + '</span><b>' + fmtSF(tot[t]) + '</b><b>' + m(totM[t]) + '</b></div>').join('');
     th += '<div class="t g"><span>Total</span><span>' + fmtSF(grand) + '</span><span>' + (priced ? G.fmtMoney(money) : '—') + '</span></div>';
     if (missing) th += '<p style="color:#c0392b">' + missing + ' item(s) need a scale on their page.</p>';
     $('totals').innerHTML = th;
@@ -816,7 +969,7 @@
       try {
         const p = JSON.parse(await f.text());
         if (!p || !Array.isArray(p.items)) throw new Error('not a takeoff project file');
-        S.proj = Object.assign(newProject(), p); S.activeId = null; autosave();
+        S.proj = Object.assign(newProject(), migrateProj(p)); S.activeId = null; autosave();
         $('jobName').value = S.proj.jobName || '';
         renderPanel(); drawOverlay(); updatePageUI();
         toast('Project loaded' + (S.proj.pdfName ? ' – open the plan "' + S.proj.pdfName + '" if it isn\'t showing' : ''), 4000);
@@ -825,6 +978,14 @@
     $('btnPrev').onclick = () => { finishTool(); showPage(S.pageNum - 1); };
     $('btnNext').onclick = () => { finishTool(); showPage(S.pageNum + 1); };
     $('btnPage').onclick = pageDialog;
+    $('btnUndo').onclick = doUndo; $('btnRedo').onclick = doRedo;
+    document.addEventListener('keydown', e => {
+      if (!(e.metaKey || e.ctrlKey) || e.altKey) return;
+      const t = e.target; if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT')) return;
+      const k = e.key.toLowerCase();
+      if (k === 'z' && !e.shiftKey) { e.preventDefault(); doUndo(); }
+      else if ((k === 'z' && e.shiftKey) || k === 'y') { e.preventDefault(); doRedo(); }
+    });
     $('btnScale').onclick = scaleDialog;
     $('btnRuler').onclick = () => startTool('measure');
     $('btnOrtho').onclick = () => { S.ortho = !S.ortho; $('btnOrtho').classList.toggle('on', S.ortho); toast(S.ortho ? 'Square ON: lines snap level/plumb' : 'Square OFF'); };
@@ -837,7 +998,8 @@
   function pageDialogIfMany() { if (S.pageCount > 1) pageDialog(); }
 
   async function restore() {
-    try { const p = JSON.parse(localStorage.getItem(LS_KEY) || 'null'); if (p && Array.isArray(p.items)) S.proj = Object.assign(newProject(), p); } catch (e) { }
+    try { const p = JSON.parse(localStorage.getItem(LS_KEY) || 'null'); if (p && Array.isArray(p.items)) S.proj = Object.assign(newProject(), migrateProj(p)); } catch (e) { }
+    resetHistory();
     $('jobName').value = S.proj.jobName || '';
     renderPanel(); updatePageUI();
     try {
@@ -848,7 +1010,7 @@
 
   // test hook: lets an automated test load a PDF from a URL
   window.__openPdfUrl = async (url, name) => { const r = await fetch(url); await openPdfBytes(await r.arrayBuffer(), name || url.split('/').pop()); };
-  window.__api = { zoomToPts, autoTrace, addItem, onTap, setScale, showPage, startTool, finishTool, askCalibrationLength, fitView, G };
+  window.__api = { doUndo, doRedo, roofNewSection, setSectionPitch, deleteSection, highlightSection, migrateProj, zoomToPts, autoTrace, addItem, onTap, setScale, showPage, startTool, finishTool, askCalibrationLength, fitView, G };
 
   wire(); initGestures(); restore();
   if ('serviceWorker' in navigator && (location.protocol === 'https:' || location.hostname === 'localhost')) navigator.serviceWorker.register('sw.js').catch(() => { });

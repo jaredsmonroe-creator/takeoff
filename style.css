@@ -84,3 +84,21 @@ button.danger { background:#c0392b; color:#fff; border-color:#c0392b; }
 #spin .spinbox { background:#fff; border-radius:16px; padding:22px 28px; display:flex; flex-direction:column; align-items:center; gap:12px; font-size:18px; font-weight:600; }
 #spin .wheel { width:44px; height:44px; border:5px solid #d6dde4; border-top-color:var(--accent); border-radius:50%; animation:spin .8s linear infinite; }
 @keyframes spin { to { transform:rotate(360deg); } }
+
+/* v1.7 undo / redo + roof sections */
+#topbar .grp.hist { gap:4px; position:sticky; left:0; z-index:2; background:var(--bar); padding:0 4px; border-radius:12px; }
+#topbar .histbtn { min-width:84px; min-height:48px; font-size:17px; font-weight:700; background:#ffd84d; border-color:#c9a800; }
+#topbar .histbtn:disabled { background:#5b7189; border-color:#5b7189; color:#c9d3dd; opacity:.7; }
+@media (max-width: 700px) { #topbar .histbtn { min-width:64px; font-size:15px; } }
+.secs { flex-basis:100%; margin-top:6px; display:flex; flex-direction:column; gap:4px; }
+#list .item { flex-wrap:wrap; }
+.sec { display:grid; grid-template-columns:44px 92px 1fr 1fr 44px; gap:6px; align-items:center; background:#fff5f5; border:1px solid #f0c9c9; border-radius:8px; padding:3px 4px; cursor:pointer; }
+.sec.hl { background:#fff3c4; border:2px solid #ff9500; }
+.sec .secn { min-width:40px; min-height:40px; padding:0; font-weight:800; }
+.sec select { min-height:40px; padding:4px; border:1px solid var(--line); border-radius:8px; font-size:16px; width:92px; }
+.sec .secv { font-size:15px; white-space:nowrap; text-align:right; } .sec .secv small { color:#6a7682; font-size:11px; }
+.sec .secdel { min-width:40px; min-height:40px; padding:0; }
+.sec .sechint, .secs > .sechint { grid-column:1 / -1; font-size:12px; color:#8a5a00; }
+.secadd { min-height:44px; font-weight:700; color:#d62728; border:1px dashed #d62728; background:#fff; }
+.modalbox .quick { display:flex; flex-wrap:wrap; gap:6px; margin:8px 0; }
+.modalbox .pitchgrid { grid-template-columns:repeat(auto-fill,minmax(72px,1fr)); }
