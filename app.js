@@ -3,7 +3,7 @@
   'use strict';
   const G = window.TakeoffGeom;
   const $ = id => document.getElementById(id);
-  const APP_VERSION = '1.7.0';
+  const APP_VERSION = '1.7.1';
   pdfjsLib.GlobalWorkerOptions.workerSrc = 'vendor/pdf.worker.min.js';
 
   const COLORS = ['#d62728', '#1f77b4', '#2ca02c', '#9467bd', '#ff7f0e', '#8c564b', '#e377c2', '#17becf', '#bcbd22', '#7f7f7f', '#393b79', '#e7298a'];
@@ -231,6 +231,13 @@
             if (navigator.vibrate) { try { navigator.vibrate(30); } catch (er) { } }
             pulse(g0.sx, g0.sy); drawOverlay(); refreshPanelLive(); updateHud();
           }, 500); }
+          else if (!S.tool) { const g0 = gest; g0.lpTimer = setTimeout(() => {
+            // long press on any measured area / line (not a point, not the selected line's edge) = select that line item
+            if (gest !== g0 || g0.mode !== 'pending' || ptrs.size !== 1) return;
+            const h = hitShape(g0.sx, g0.sy); if (!h) return;
+            gest = { mode: 'none' }; // no tap / point on release
+            selectFromPlan(h, g0.sx, g0.sy);
+          }, 500); }
         }
       } else if (ptrs.size === 2) {
         if (gest && gest.lpTimer) clearTimeout(gest.lpTimer);
@@ -338,6 +345,61 @@
       });
     });
     return best;
+  }
+  function inPoly(p, pts) {
+    let c = false;
+    for (let i = 0, j = pts.length - 1; i < pts.length; j = i++) {
+      const a = pts[i], b = pts[j];
+      if ((a[1] > p[1]) !== (b[1] > p[1]) && p[0] < (b[0] - a[0]) * (p[1] - a[1]) / (b[1] - a[1]) + a[0]) c = !c;
+    }
+    return c;
+  }
+  function segDist(p, a, b) {
+    const dx = b[0] - a[0], dy = b[1] - a[1], L2 = dx * dx + dy * dy;
+    const t = L2 ? Math.max(0, Math.min(1, ((p[0] - a[0]) * dx + (p[1] - a[1]) * dy) / L2)) : 0;
+    return G.dist(p, [a[0] + t * dx, a[1] + t * dy]);
+  }
+  /* which measured shape is under a screen point: inside an area (smallest wins) or near a line; later items are on top */
+  function hitShape(cx, cy) {
+    const p = toStage(cx, cy), tol = 22 / S.view.s; let best = null;
+    const consider = (rank, it, si) => { if (!best || rank < best.rank || (rank === best.rank && S.proj.items.indexOf(it) > S.proj.items.indexOf(best.it))) best = { rank, it, si }; };
+    S.proj.items.forEach(it => {
+      if (it.page !== S.pageNum) return;
+      const area = G.isArea(it.type);
+      it.shapes.forEach((sh, si) => {
+        const pts = sh.pts; if (!pts.length) return;
+        if (area && pts.length >= 3 && inPoly(p, pts)) { consider(G.polygonArea(pts), it, si); return; }
+        let d = Infinity;
+        for (let i = 0; i + 1 < pts.length; i++) d = Math.min(d, segDist(p, pts[i], pts[i + 1]));
+        if (area && pts.length >= 3) d = Math.min(d, segDist(p, pts[pts.length - 1], pts[0]));
+        if (pts.length === 1) d = G.dist(p, pts[0]);
+        if (d <= tol) consider(area ? G.polygonArea(pts) || 0 : 0, it, si); // lines rank as the smallest thing under the finger
+      });
+    });
+    return best;
+  }
+  function selectFromPlan(h, cx, cy) {
+    const it = h.it;
+    finishTool();
+    if (S.activeId !== null && S.activeId !== it.id) { const prev = activeItem(); const last = prev && prev.shapes[prev.shapes.length - 1]; if (last && !last.pts.length) prev.shapes.pop(); }
+    S.activeId = it.id; S.selPt = null;
+    S.hlSec = it.type === 'roof' ? { id: it.id, si: h.si } : null;
+    if (!S.panelOpen) togglePanel(true);
+    renderPanel(); drawOverlay(); updateHud();
+    if (navigator.vibrate) { try { navigator.vibrate(30); } catch (er) { } }
+    pulse(cx, cy);
+    const card = $('list').querySelector('.item[data-id="' + it.id + '"]');
+    if (card) {
+      const row = it.type === 'roof' ? card.querySelector('.sec[data-sec="' + it.id + ':' + h.si + '"]') : null;
+      (row || card).scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+      card.classList.remove('flash'); void card.offsetWidth; card.classList.add('flash');
+      if (row) { row.classList.remove('flash'); void row.offsetWidth; row.classList.add('flash'); }
+    }
+    const c = calc(it);
+    let msg = 'Selected ' + it.name + ' · ' + fmtSF(c.sf);
+    if (it.type === 'roof' && c.sections && c.sections[h.si]) { const x = c.sections[h.si]; msg = 'Selected ' + it.name + ' · section ' + (h.si + 1) + ' · ' + x.pitch + '/12: flat ' + Math.round(x.flat).toLocaleString() + ' → sloped ' + Math.round(x.sloped).toLocaleString() + ' sf'; }
+    toast(msg, 3000);
+    window.__lastLongPress = { id: it.id, si: h.si };
   }
   function pulse(cx, cy) {
     const r = $('viewport').getBoundingClientRect(), d = document.createElement('div');
@@ -798,6 +860,7 @@
       '<li>Tap <b>+ Roof</b> (pick the pitch), <b>+ Walls</b> (pick the floor and wall height), <b>+ Garage Ceiling</b>, etc.</li>' +
       '<li>Tap the corners on the plan. For areas, tap the first point to close it. <b>New section</b> adds another piece to the same line. Drag a white dot to fix it.</li>' +
       '<li><b>↶ Undo / ↷ Redo</b> (top bar): Undo takes back the last thing you did – a point, a closed or deleted section, a pitch, scale, height, name or price change, an Auto Trace, a deleted line. Redo puts it back. Doing something new clears Redo. Keyboard: ⌘Z / ⇧⌘Z.</li>' +
+      '<li><b>Find a line on the plan:</b> press and hold inside any measured area (or on a wall line) for half a second – that line item gets selected in the list, and for a roof its section lights up.</li>' +
       '<li><b>Roofs with several pitches:</b> tap <b>+ Roof</b>, name it (Main House, Garage Roof…) and pick the first pitch. Trace that section. Tap <b>＋ Section</b> on the roof card, pick the next pitch and trace it – each roof keeps its own list of sections. Each section has its own pitch dropdown you can change any time; its sloped sf = flat sf × pitch factor, and the roof total adds up all its sections. Tap a section number to show it on the plan. <b>All roofs</b> in the totals adds every roof.</li>' +
       '<li><b>Jogs / bump-outs:</b> press and hold anywhere on a line (about half a second) until it pulses, then drag without lifting – a new corner follows your finger. Or tap/drag the <b>+</b> in the middle of a line. To remove a point, press and hold it, then tap <b>🗑 Delete point</b>. Undo works for all of these.</li>' +
       '<li><b>✨ Auto Trace</b> (CAD/vector PDFs, not scans): add a line (Walls, Roof, Garage…) and tap <b>Auto Trace this page</b>. It draws ONE loop around the outside of the exterior walls – garage included – and zooms to it with the LF shown at the top. Move points to take out the garage or porches. Sheet with several plans? Zoom in on the one you want, or tap one spot inside it first. It skips schedules, notes and the title block. Shrunk printouts (11×17): calibrate the scale first. Undo puts it back.</li>' +
