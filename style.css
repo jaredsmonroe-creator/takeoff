@@ -106,3 +106,5 @@ button.danger { background:#c0392b; color:#fff; border-color:#c0392b; }
 /* v1.7.1 long-press select flash */
 @keyframes flashsel { 0% { box-shadow:0 0 0 0 rgba(255,149,0,.9); background:#fff3c4; } 100% { box-shadow:0 0 0 12px rgba(255,149,0,0); } }
 #list .item.flash, .sec.flash { animation:flashsel .9s ease-out; }
+
+#traceBanner .tbText { display: block; flex: 1 1 auto; min-width: 0; text-align: left; line-height: 1.35; }

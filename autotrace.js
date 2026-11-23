@@ -12,7 +12,8 @@
     const mul = (m, n) => [m[0] * n[0] + m[2] * n[1], m[1] * n[0] + m[3] * n[1], m[0] * n[2] + m[2] * n[3], m[1] * n[2] + m[3] * n[3], m[0] * n[4] + m[2] * n[5] + m[4], m[1] * n[4] + m[3] * n[5] + m[5]];
     let ctm = [1, 0, 0, 1, 0, 0], lw = 1, sc = [0, 0], fc = [0, 0]; const stack = [];
     const col = a => { const r = +a[0], g = +a[1], b = +a[2]; return [(0.299 * r + 0.587 * g + 0.114 * b) / 255, Math.max(r, g, b) - Math.min(r, g, b) > 40 ? 1 : 0]; };
-    const segs = []; let path = [];
+    const segs = []; let path = [], imgArea = 0;
+    const IMG = new Set([OPS.paintImageXObject, OPS.paintJpegXObject, OPS.paintInlineImageXObject, OPS.paintImageXObjectRepeat].filter(x => x !== undefined));
     const STROKE = new Set([OPS.stroke, OPS.closeStroke, OPS.fillStroke, OPS.eoFillStroke, OPS.closeFillStroke, OPS.closeEOFillStroke]);
     const PAINT = new Set([...STROKE, OPS.fill, OPS.eoFill, OPS.endPath]);
     for (let i = 0; i < ol.fnArray.length; i++) {
@@ -44,14 +45,18 @@
         }
         path._w = lw * Math.sqrt(Math.abs(M[0] * M[3] - M[1] * M[2]));
       }
+      if (IMG.has(fn)) { const M = mul(VT, ctm); imgArea += Math.abs(M[0] * M[3] - M[1] * M[2]); }
       if (PAINT.has(fn)) {
         if (STROKE.has(fn) && path.length) { const w = Math.round((path._w || 0) * 100) / 100; for (const s of path) segs.push([s[0][0], s[0][1], s[1][0], s[1][1], w, sc[0], 0, sc[1]]); }
         else if ((fn === OPS.fill || fn === OPS.eoFill) && path.length && fc[0] < 0.6 && !fc[1]) { for (const s of path) segs.push([s[0][0], s[0][1], s[1][0], s[1][1], -1, fc[0], 1, 0]); } // dark wall poché
         path = [];
       }
     }
+    segs._imgFrac = imgArea / Math.max(1, Math.abs(vp.width * vp.height));
     return segs;
   };
+  /* a scanned / photographed sheet: one big picture and (almost) no drawn lines */
+  AT.isRaster = function (segs) { return (segs._imgFrac || 0) > 0.25 && segs.length < 2500; };
   AT.pageText = async function (page) { const tc = await page.getTextContent(); return tc.items.map(t => t.str).join(' '); };
   /* text positions (page coords) – used to skip schedules / notes / title blocks */
   AT.textItems = async function (page, pdfjsLib) {
@@ -81,7 +86,7 @@
     const thr = 0.006 * Math.max(W, H), g = new Map();
     for (const s of segs) {
       const [x1, y1, x2, y2, w0, lum, fill, colored] = s;
-      if (colored || (!fill && lum > 0.45)) continue; // grey grid lines, orange/red dimensions
+      if (colored || (!fill && lum > 0.62)) continue; // grey grid lines, orange/red dimensions
       const w = fill ? 'F' : w0;
       if ((Math.abs(x1 - x2) < 0.3 || Math.abs(y1 - y2) < 0.3) && Math.hypot(x2 - x1, y2 - y1) > thr) { if (!g.has(w)) g.set(w, []); g.get(w).push(s); }
     }
@@ -419,7 +424,7 @@
   AT.runSimple = function (segs, W, H, opts) {
     const long_ = Math.max(W, H), thr = 0.006 * long_, ppf = opts.ppf, byW = new Map(), tb = AT.titleBox(segs, W, H);
     const pool = [], tot = new Map();
-    for (const s of segs) { const L = Math.hypot(s[2] - s[0], s[3] - s[1]); if (Math.min(s[0], s[2]) > tb[0] + 2 && Math.max(s[0], s[2]) < tb[2] - 2 && Math.min(s[1], s[3]) > tb[1] + 2 && Math.max(s[1], s[3]) < tb[3] - 2 && !s[6] && !s[7] && L > thr && L < 0.9 * Math.max(W, H) && s[4] > 0) { pool.push(s); tot.set(s[4], (tot.get(s[4]) || 0) + L); } }
+    const hatch = AT.findHatch(segs, ppf); for (let si = 0; si < segs.length; si++) { const s = segs[si]; if (hatch[si]) continue; const L = Math.hypot(s[2] - s[0], s[3] - s[1]); if (Math.min(s[0], s[2]) > tb[0] + 2 && Math.max(s[0], s[2]) < tb[2] - 2 && Math.min(s[1], s[3]) > tb[1] + 2 && Math.max(s[1], s[3]) < tb[3] - 2 && !s[6] && !s[7] && L > thr && L < 0.9 * Math.max(W, H) && s[4] > 0) { pool.push(s); tot.set(s[4], (tot.get(s[4]) || 0) + L); } }
     // roof edges, hips and ridges are often drawn in two or three heavy weights: try "this weight and everything heavier"
     const ws = [...tot.keys()].filter(w => tot.get(w) > 20 * ppf).sort((a, b) => b - a);
     for (const w of ws) byW.set(w, pool.filter(s => s[4] >= w - 1e-6));
@@ -453,10 +458,264 @@
   };
   function G_inPoly(p, poly) { let c = false; for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) { const a = poly[i], b = poly[j]; if ((a[1] > p[1]) !== (b[1] > p[1]) && p[0] < (b[0] - a[0]) * (p[1] - a[1]) / (b[1] - a[1]) + a[0]) c = !c; } return c; }
 
+  /* ---------- 4b. v1.8 wall finder: every wall-like line (any weight, black or mid-grey), hatching removed ---------- */
+  /* hatch = runs of 6+ evenly spaced parallel lines (decking, shingles, stair treads, schedule rows). Returns Uint8Array flags. */
+  AT.findHatch = function (segs, ppf) {
+    if (segs._hatch && segs._hatchPpf === ppf) return segs._hatch;
+    const n = segs.length, flag = new Uint8Array(n), minL = 1.2 * ppf, maxGap = 1.6 * ppf, minGap = 0.08 * ppf;
+    const bk = new Map();
+    for (let i = 0; i < n; i++) {
+      const s = segs[i], dx = s[2] - s[0], dy = s[3] - s[1], L = Math.hypot(dx, dy); if (L < minL) continue;
+      let a = Math.atan2(dy, dx) * 180 / Math.PI; if (a < 0) a += 180; if (a >= 179.75) a -= 180;
+      const k = Math.round(a * 2), ar = k / 2 * Math.PI / 180, ux = Math.cos(ar), uy = Math.sin(ar);
+      const off = -s[0] * uy + s[1] * ux, t0 = s[0] * ux + s[1] * uy, t1 = s[2] * ux + s[3] * uy;
+      if (!bk.has(k)) bk.set(k, []); bk.get(k).push({ i, off, a: Math.min(t0, t1), b: Math.max(t0, t1) });
+    }
+    for (const [, arr] of bk) {
+      if (arr.length < 6) continue;
+      arr.sort((p, q) => p.off - q.off);
+      const nx = new Int32Array(arr.length).fill(-1), gap = new Float64Array(arr.length), hasPrev = new Uint8Array(arr.length);
+      for (let p = 0; p < arr.length; p++) {
+        const P = arr[p];
+        for (let q = p + 1; q < arr.length; q++) {
+          const Q = arr[q], d = Q.off - P.off; if (d > maxGap) break; if (d < minGap) continue;
+          const ov = Math.min(P.b, Q.b) - Math.max(P.a, Q.a);
+          if (ov > 0.4 * Math.min(P.b - P.a, Q.b - Q.a)) { nx[p] = q; gap[p] = d; hasPrev[q] = 1; break; }
+        }
+      }
+      for (let h = 0; h < arr.length; h++) {
+        if (hasPrev[h] || nx[h] < 0) continue;
+        // walk the chain, cut it where the spacing changes by more than 30%
+        let run = [h], g0 = gap[h], p = h;
+        const flush = () => { if (run.length >= 6) run.forEach(r => { flag[arr[r].i] = 1; }); };
+        while (nx[p] >= 0) {
+          const q = nx[p], g = gap[p];
+          if (Math.abs(g - g0) > 0.3 * g0) { flush(); run = [p]; g0 = g; }
+          run.push(q); p = q;
+        }
+        flush();
+      }
+    }
+    segs._hatch = flag; segs._hatchPpf = ppf;
+    return flag;
+  };
+  function rasterSeg(g, W, H, s, x0, y0, c, pad) {
+    const L = Math.hypot(s[2] - s[0], s[3] - s[1]), n = Math.ceil(L / (c * 0.4)) + 1;
+    for (let q = 0; q <= n; q++) {
+      const x = s[0] + (s[2] - s[0]) * q / n, y = s[1] + (s[3] - s[1]) * q / n;
+      const i = Math.floor((x - x0) / c) + pad, j = Math.floor((y - y0) / c) + pad;
+      if (i >= 0 && j >= 0 && i < W && j < H) g[j * W + i] = 1;
+    }
+  }
+  /* wall-like = has a parallel, overlapping partner 2"–15" away (the two faces of a wall) */
+  // dashed lines (beams, overhangs, ceiling changes, porch roofs): short collinear dashes with regular gaps; never walls
+  function dashedMask(cand, ppf) {
+    const out = new Uint8Array(cand.length), bk = new Map();
+    cand.forEach((s, i) => {
+      const L = Math.hypot(s[2] - s[0], s[3] - s[1]); if (L > 2.5 * ppf) return;
+      let a = Math.atan2(s[3] - s[1], s[2] - s[0]) * 180 / Math.PI; if (a < 0) a += 180; if (a >= 179.5) a -= 180;
+      const k = Math.round(a * 2) / 2, ar = k * Math.PI / 180, ux = Math.cos(ar), uy = Math.sin(ar);
+      const off = -s[0] * uy + s[1] * ux, t0 = s[0] * ux + s[1] * uy, t1 = s[2] * ux + s[3] * uy;
+      const key = k + ':' + Math.round(off / 0.6);
+      if (!bk.has(key)) bk.set(key, []); bk.get(key).push({ i, a: Math.min(t0, t1), b: Math.max(t0, t1) });
+    });
+    for (const [, arr] of bk) {
+      if (arr.length < 3) continue;
+      arr.sort((p, q) => p.a - q.a);
+      let run = [arr[0]];
+      const flush = () => { if (run.length >= 3) run.forEach(r => { out[r.i] = 1; }); };
+      for (let j = 1; j < arr.length; j++) {
+        const gap = arr[j].a - run[run.length - 1].b;
+        if (gap > 0.04 * ppf && gap < 1.5 * ppf) run.push(arr[j]); else { flush(); run = [arr[j]]; }
+      }
+      flush();
+    }
+    return out;
+  }
+  function pairedWalls(cand, ppf) {
+    const keep = new Uint8Array(cand.length), ovs = new Float64Array(cand.length), bk = new Map(), lo = (2 / 12) * ppf, hi = (15 / 12) * ppf;
+    cand.forEach((s, i) => {
+      const dx = s[2] - s[0], dy = s[3] - s[1];
+      let a = Math.atan2(dy, dx) * 180 / Math.PI; if (a < 0) a += 180; if (a >= 179) a -= 180;
+      const k = Math.round(a), ar = k * Math.PI / 180, ux = Math.cos(ar), uy = Math.sin(ar);
+      const off = -s[0] * uy + s[1] * ux, t0 = s[0] * ux + s[1] * uy, t1 = s[2] * ux + s[3] * uy;
+      if (!bk.has(k)) bk.set(k, []); bk.get(k).push({ i, off, a: Math.min(t0, t1), b: Math.max(t0, t1) });
+    });
+    for (const [, arr] of bk) {
+      arr.sort((p, q) => p.off - q.off);
+      for (let p = 0; p < arr.length; p++) for (let q = p + 1; q < arr.length; q++) {
+        const d = arr[q].off - arr[p].off; if (d > hi) break; if (d < lo) continue;
+        const wp = Math.max(0.05, cand[arr[p].i][4] || 0), wq = Math.max(0.05, cand[arr[q].i][4] || 0);
+        if (Math.max(wp, wq) / Math.min(wp, wq) > 1.8) continue; // a wall's two faces are drawn alike; a thin dimension / extension line next to a heavier edge is not a wall
+        const ov = Math.min(arr[p].b, arr[q].b) - Math.max(arr[p].a, arr[q].a);
+        if (ov >= Math.min(0.75 * ppf, 0.5 * Math.min(arr[p].b - arr[p].a, arr[q].b - arr[q].a))) {
+          // a short partner (a post square's side) only vouches for a short line
+          const Lp = arr[p].b - arr[p].a, Lq = arr[q].b - arr[q].a;
+          if (Lq >= 1.6 * ppf || Lp < 4 * ppf) ovs[arr[p].i] += ov;
+          if (Lp >= 1.6 * ppf || Lq < 4 * ppf) ovs[arr[q].i] += ov;
+        }
+      }
+    }
+    // enough of the line has a partner: a long porch edge / beam line running past a few small post squares is not a wall
+    cand.forEach((s, i) => { const L = Math.hypot(s[2] - s[0], s[3] - s[1]); if (ovs[i] > 0 && ovs[i] >= Math.min(0.25 * L, 3 * ppf)) keep[i] = 1; });
+    return cand.filter((s, i) => keep[i]);
+  }
+  /* opts: {ppf, target, text}. Returns {building (house only, porches + garage left out), garage, porches, ...} */
+  AT.runWalls2 = function (segs, W0, H0, opts) {
+    const ppf = opts.ppf, tb = AT.titleBox(segs, W0, H0), hatch = AT.findHatch(segs, ppf);
+    const inTB = s => Math.min(s[0], s[2]) > tb[0] + 2 && Math.max(s[0], s[2]) < tb[2] - 2 && Math.min(s[1], s[3]) > tb[1] + 2 && Math.max(s[1], s[3]) < tb[3] - 2;
+    let cand = []; const hs = [];
+    segs.forEach((s, i) => {
+      if (!inTB(s)) return;
+      const L = Math.hypot(s[2] - s[0], s[3] - s[1]);
+      if (hatch[i]) { hs.push(s); return; }
+      if (s[7] || L < 0.25 * ppf || L > 0.6 * Math.min(W0, H0)) return; // coloured (dims, notes), specks, sheet frames
+      if (!s[6] && s[5] > 0.62) return; // light grey
+      cand.push(s);
+    });
+    // dimension strings: a line with a feet-inch dimension (12'-6") written right along it is a dimension line, not a wall
+    const dimT = (opts.text || []).filter(t => { const v = String(t[3] || '').trim(); return /\d\s*['’]|\d\s*["”]/.test(v) && /^[±+~]?\s*(\d+\s*['’]\s*-?\s*)?(\d+(\s+\d+\/\d+|\s*[½¼¾⅛⅜⅝⅞])?\s*["”]?)?$/.test(v); }); // just a dimension (12'-6", 4'-0 5/8") – not a note like ±7'-0" WALL
+    if (dimT.length) {
+      const near = 0.9 * ppf, cellD = 4 * ppf, grid = new Map(), key = (x, y) => Math.floor(x / cellD) + ',' + Math.floor(y / cellD);
+      dimT.forEach(t => { const k = key(t[4], t[5]); if (!grid.has(k)) grid.set(k, []); grid.get(k).push(t); });
+      const isDim = s => {
+        const dx = s[2] - s[0], dy = s[3] - s[1], L = Math.hypot(dx, dy); if (L < 1e-6) return false;
+        const ux = dx / L, uy = dy / L, x0 = Math.min(s[0], s[2]) - cellD, x1 = Math.max(s[0], s[2]) + cellD, y0 = Math.min(s[1], s[3]) - cellD, y1 = Math.max(s[1], s[3]) + cellD;
+        for (let gx = Math.floor(x0 / cellD); gx <= Math.floor(x1 / cellD); gx++) for (let gy = Math.floor(y0 / cellD); gy <= Math.floor(y1 / cellD); gy++) {
+          for (const t of grid.get(gx + ',' + gy) || []) {
+            const px = t[4] - s[0], py = t[5] - s[1], along = px * ux + py * uy, perp = Math.abs(-px * uy + py * ux);
+            if (along > 0 && along < L && perp < near) return true;
+          }
+        }
+        return false;
+      };
+      cand = cand.filter(s => !isDim(s));
+    }
+    { const dm = dashedMask(cand, ppf); cand = cand.filter((s, i) => !dm[i]); }
+    let ls = pairedWalls(cand, ppf);
+    if (ls.length < 12) return { error: 'nowalls' };
+    // drop schedules / notes / legends: wall-like lines packed with text
+    const text = opts.text || [];
+    const cell = 0.5, c = cell * ppf, pad = Math.floor(12 / cell);
+    const bb = bbox(ls), x0 = bb[0], y0 = bb[1];
+    const W = Math.floor((bb[2] - x0) / c) + 2 * pad + 1, H = Math.floor((bb[3] - y0) / c) + 2 * pad + 1;
+    if (W * H > 6e6) return { error: 'too big' };
+    const g = new Uint8Array(W * H); ls.forEach(s => rasterSeg(g, W, H, s, x0, y0, c, pad));
+    // text-heavy blobs (tags, schedules) out
+    const tcnt = new Int32Array(W * H);
+    for (const t of text) { const i = Math.floor((t[4] - x0) / c) + pad, j = Math.floor((t[5] - y0) / c) + pad; if (i >= 0 && j >= 0 && i < W && j < H) tcnt[j * W + i] += t[2]; }
+    for (const cc of components(g, W, H)) {
+      let a = 1e9, b = 1e9, cx = -1, dy = -1; cc.forEach(p => { const x = p % W, y = (p - x) / W; a = Math.min(a, x); b = Math.min(b, y); cx = Math.max(cx, x); dy = Math.max(dy, y); });
+      const span = Math.max(cx - a, dy - b) * cell;
+      if (span < 5) { let tc = 0; for (let y = b; y <= dy; y++) for (let x = a; x <= cx; x++) tc += tcnt[y * W + x]; if (tc > 0) cc.forEach(p => { g[p] = 0; }); }
+      else { let tc = 0; for (let y = b; y <= dy; y++) for (let x = a; x <= cx; x++) tc += tcnt[y * W + x]; const ar = (cx - a + 1) * (dy - b + 1) * cell * cell; if (tc / ar > 1.2) cc.forEach(p => { g[p] = 0; }); }
+    }
+    // hatched areas (porches, decks, patios)
+    const hg = new Uint8Array(W * H); hs.forEach(s => rasterSeg(hg, W, H, s, x0, y0, c, pad));
+    const hreg = closing(hg, W, H, Math.ceil(1.7 / cell));
+    const block = new Uint8Array(W * H); for (let p = 0; p < W * H; p++) block[p] = g[p] || hreg[p] ? 1 : 0;
+    const ins = insideMask(block, W, H, Math.round((opts.closeFt || 3) / cell));
+    // a hatched patch that touches (or nearly touches) the outside is a porch / deck / patio – never part of the house
+    const outside = inv(ins), outN = dil(outside, W, H, 8), porch = new Uint8Array(W * H), porches = [];
+    for (const cc of components(hreg, W, H)) {
+      if (cc.length * cell * cell < 30) continue;
+      let touch = false; for (const p of cc) if (outN[p]) { touch = true; break; }
+      if (touch) { cc.forEach(p => { porch[p] = 1; }); porches.push(cc.length * cell * cell); }
+    }
+    // rooms by their labels: every open cell belongs to the nearest room name (walking around walls);
+    // PORCH / DECK / PATIO / PORTE COCHERE… rooms are left out, GARAGE becomes its own outline
+    const PORCH = /\b(PORCH|DECK|PATIO|PORTE[\s-]*COCHERE|TERRACE|BREEZEWAY|LANAI|VERANDA|PERGOLA|STOOP|CARPORT|BALCONY|SCREENED|GRILL(ING)?|OUTDOOR (LIVING|KITCHEN))\b/i;
+    const GAR = /\bGARAGE\b/i;
+    const free = new Uint8Array(W * H); for (let p = 0; p < W * H; p++) free[p] = ins[p] && !g[p] && !porch[p] ? 1 : 0;
+    const own = new Int32Array(W * H).fill(-1), q = new Int32Array(W * H), kinds = []; let qh = 0, qt = 0;
+    for (const tx of text) {
+      const str = String(tx[3] || '').trim(); if (str.length < 3) continue;
+      const porchNote = str.length <= 30 && PORCH.test(str) && !/\b(ROOF|SEE|DETAIL|BEAM|RAIL|COLUMN|POST|CEILING|CLG|SLAB|FOOTING|STEP|STAIR)/i.test(str); // "DROP PORCH 4\" BELOW" sits in the porch
+      if (!porchNote && (/\d|@|"|'/.test(str) || !(/^[A-Z][A-Z .&\/-]+$/.test(str) || (/^[A-Za-z][A-Za-z .&\/-]{2,30}$/.test(str) && (PORCH.test(str) || GAR.test(str)))))) continue;
+      const i = Math.floor((tx[4] - x0) / c) + pad, j = Math.floor((tx[5] - y0) / c) + pad; if (i < 0 || j < 0 || i >= W || j >= H) continue;
+      const kind = PORCH.test(str) ? 'porch' : GAR.test(str) && !/DOOR|OPENER/i.test(str) ? 'garage' : 'room';
+      let p0 = j * W + i, seeds = [p0];
+      if (!free[p0]) {
+        seeds = [];
+        // a label written on a wall line (e.g. "NEW DECK" / "EX. DECK" either side of a deck edge): a porch label seeds both sides
+        for (let r = 1; r <= (kind === 'porch' ? 3 : 2) && (!seeds.length || kind === 'porch'); r++) for (let dy = -r; dy <= r; dy++) for (let dx = -r; dx <= r; dx++) { const pp = (j + dy) * W + i + dx; if (pp >= 0 && pp < W * H && free[pp]) seeds.push(pp); }
+        if (!seeds.length) continue;
+        if (kind !== 'porch') seeds = [seeds[0]];
+      }
+      seeds = seeds.filter(pp => own[pp] < 0); if (!seeds.length) continue;
+      const k = kinds.length; kinds.push(kind); seeds.forEach(pp => { own[pp] = k; q[qt++] = pp; });
+    }
+    while (qh < qt) { const p = q[qh++], x = p % W; for (const nb of [x + 1 < W ? p + 1 : -1, x > 0 ? p - 1 : -1, p + W < W * H ? p + W : -1, p - W >= 0 ? p - W : -1]) if (nb >= 0 && free[nb] && own[nb] < 0) { own[nb] = own[p]; q[qt++] = nb; } }
+    // a "porch" label that claims a huge area has leaked into the house (no room names to stop it): ignore it
+    { const cnt = new Int32Array(kinds.length); for (let p = 0; p < W * H; p++) if (own[p] >= 0) cnt[own[p]]++;
+      kinds.forEach((kd, k) => { if (kd === 'porch' && cnt[k] * cell * cell > 1200) kinds[k] = 'room'; }); }
+    const garCells = new Uint8Array(W * H); let nGar = 0, nPorchLab = 0;
+    let M = new Uint8Array(W * H);
+    for (let p = 0; p < W * H; p++) {
+      const k = own[p] >= 0 ? kinds[own[p]] : null;
+      if (k === 'garage') { garCells[p] = 1; nGar++; }
+      if (k === 'porch') nPorchLab++;
+      M[p] = ins[p] && !porch[p] && k !== 'porch' && k !== 'garage' ? 1 : 0;
+    }
+    if (nPorchLab) porches.push(nPorchLab * cell * cell);
+    if (opts.debug) opts.debug.masks = { W, H, ins, porch, hreg, g, own, kinds };
+    // walls only count where they bound a room that is kept (a porch beam / garage wall on its own is dropped)
+    const room = new Uint8Array(W * H); for (let p = 0; p < W * H; p++) room[p] = M[p] && free[p] ? 1 : 0;
+    const roomN = dil(room, W, H, 3);
+    for (let p = 0; p < W * H; p++) if (M[p] && !free[p] && !roomN[p]) M[p] = 0;
+    M = opening(M, W, H, 3); // slivers of wall left along a porch / the garage
+    if (opts.debug) opts.debug.masks.M = M;
+    const comps = components(M, W, H).filter(cc => cc.length * cell * cell >= 150);
+    if (!comps.length) return { error: 'nowalls' };
+    const toPt = (i, j) => [x0 + (i - pad) * c, y0 + (j - pad) * c];
+    const t = opts.target, ti = t ? Math.floor((t[0] - x0) / c) + pad : 0, tj = t ? Math.floor((t[1] - y0) / c) + pad : 0;
+    const score = cc => { if (!t) return cc.length; let bd = 1e18; for (const p of cc) { const x = p % W, y = (p - x) / W, d = (x - ti) ** 2 + (y - tj) ** 2; if (d < bd) bd = d; if (!d) break; } return -bd * 1e6 + cc.length; };
+    comps.sort((a, b) => score(b) - score(a));
+    const hc = comps[0], HS = new Uint8Array(W * H); hc.forEach(p => { HS[p] = 1; });
+    let garM = null;
+    if (nGar * cell * cell >= 150) {
+      // garage outline = its labelled room plus its own walls (outside face)
+      // the garage = the inside area (not house, not porch) that holds the GARAGE label; walls included
+      const rest = new Uint8Array(W * H); for (let p = 0; p < W * H; p++) rest[p] = free[p] && !HS[p] && !(own[p] >= 0 && kinds[own[p]] === 'porch') ? 1 : 0;
+      const ro = opening(rest, W, H, 1), gcs = components(ro, W, H).filter(cc => cc.some(p => garCells[p]));
+      let gl = gcs.length ? largest(gcs) : null;
+      if (gl) { const m1 = new Uint8Array(W * H); gl.forEach(p => { m1[p] = 1; }); const d1 = dil(m1, W, H, 3); const m2 = new Uint8Array(W * H); for (let p = 0; p < W * H; p++) m2[p] = m1[p] || (d1[p] && g[p] && !HS[p]) ? 1 : 0; gl = largest(components(closing(m2, W, H, 1), W, H)); }
+      if (!gl || gl.length * cell * cell > 2000) { const gd = dil(garCells, W, H, 2); const m2 = new Uint8Array(W * H); for (let p = 0; p < W * H; p++) m2[p] = gd[p] && ins[p] && !HS[p] ? 1 : 0; gl = largest(components(m2, W, H)); }
+      garM = new Uint8Array(W * H); gl.forEach(p => { garM[p] = 1; });
+    } else {
+      // no GARAGE label: a big open bay next to the house (its door opening is too wide for the 3 ft gap closing)
+      const big = insideMask(block, W, H, Math.round(9.5 / cell));
+      let gc = new Uint8Array(W * H); for (let p = 0; p < W * H; p++) gc[p] = big[p] && !HS[p] && !porch[p] && !(own[p] >= 0 && kinds[own[p]] === 'porch') ? 1 : 0;
+      gc = opening(gc, W, H, Math.round(4 / cell));
+      const nearH = dil(HS, W, H, 4);
+      const gars = components(gc, W, H).filter(cc => cc.length * cell * cell >= 200 && cc.length * cell * cell <= 1600 && cc.some(p => nearH[p]));
+      if (gars.length) { const gg = largest(gars); garM = new Uint8Array(W * H); gg.forEach(p => { garM[p] = 1; }); }
+    }
+    const loop = outerLoop(HS, W, H, null); if (!loop) return { error: 'no loop' };
+    const tol = 1.2 * c, simp = l => snapToLines(simplifyClosed(l.map(v => toPt(v[0], v[1])), 0.7 * c), ls, tol);
+    const res = { building: simp(loop.pts), footprint: hc.length * cell * cell, houseRuns: [], garageRuns: [], ppf, v2: true, porches, cellPt: c, ls };
+    if (garM) {
+      const gl = outerLoop(garM, W, H, null);
+      if (gl) { res.garage = simp(gl.pts); res.hasGarage = true; res.garage_area = G_area(res.garage) / (ppf * ppf); }
+    }
+    return res;
+  };
+
   /* ---------- 5. one call for the app ---------- */
   // opts: {ppf, target:[x,y]|null}
   // opts: {ppf, target:[x,y]|null, text:[[x,y,nChars]]}
+  // v1.8: walls found by their two faces (any weight / grey level), hatching, dimensions and dashed lines ignored,
+  // porches / decks left out, garage traced separately. Falls back to the older single-weight trace.
   AT.run = function (segs, W, H, opts) {
+    let r = null;
+    try { r = AT.runWalls2(segs, W, H, opts); } catch (e) { r = { error: 'v2: ' + e.message }; }
+    if (r && !r.error && r.footprint >= 300) return r;
+    const old = AT.runLegacy(segs, W, H, opts);
+    if (old.error && r && !r.error) return r;
+    if (!old.error) old.legacy = true;
+    return old;
+  };
+  AT.runLegacy = function (segs, W, H, opts) {
     const tb = AT.titleBox(segs, W, H), cut = tb[2];
     const keep = s => Math.min(s[0], s[2]) > tb[0] + 2 && Math.max(s[0], s[2]) < tb[2] - 2 && Math.min(s[1], s[3]) > tb[1] + 2 && Math.max(s[1], s[3]) < tb[3] - 2;
     const opts2 = AT.chooseWalls(segs, W, H, opts.ppf, keep);
@@ -580,11 +839,25 @@
       for (const n of [x + 1 < GW ? p + 1 : -1, x > 0 ? p - 1 : -1, y + 1 < GH ? p + GW : -1, y > 0 ? p - GW : -1]) if (n >= 0 && M[n] && own[n] < 0) { own[n] = own[p]; q[t++] = n; }
     }
     const cellOf = (x, y) => { const i = Math.floor((x - x0) / c), j = Math.floor((y - y0) / c); return i >= 0 && j >= 0 && i < GW && j < GH ? j * GW + i : -1; };
-    const faces = comps.map(() => ({ cells: 0, labels: [], porch: false, taken: 0, sx: 0, sy: 0 }));
+    // a face holding labels of different pitches is missing a hip / valley line: split it between its labels
+    let nF = comps.length;
+    { const labIn = new Map();
+      for (const l of inOut) { const p = cellOf(l.x, l.y); if (p >= 0 && own[p] >= 0) { if (!labIn.has(own[p])) labIn.set(own[p], []); labIn.get(own[p]).push({ p, rise: l.rise }); } }
+      for (const [k, arr] of labIn) {
+        if (new Set(arr.map(a => a.rise)).size < 2) continue;
+        for (let p = 0; p < GW * GH; p++) if (own[p] === k) own[p] = -2;
+        const ids = {}; arr.forEach(a => { if (!(a.rise in ids)) ids[a.rise] = nF++; });
+        let h2 = 0, t2 = 0; arr.forEach(a => { if (own[a.p] === -2) { own[a.p] = ids[a.rise]; q[t2++] = a.p; } });
+        while (h2 < t2) { const p = q[h2++], x = p % GW, y = (p - x) / GW; for (const n of [x + 1 < GW ? p + 1 : -1, x > 0 ? p - 1 : -1, y + 1 < GH ? p + GW : -1, y > 0 ? p - GW : -1]) if (n >= 0 && own[n] === -2) { own[n] = own[p]; q[t2++] = n; } }
+        for (let p = 0; p < GW * GH; p++) if (own[p] === -2) own[p] = -1;
+      }
+    }
+    const faces = Array.from({ length: nF }, () => ({ cells: 0, labels: [], porch: false, taken: 0, sx: 0, sy: 0 }));
     for (let p = 0; p < GW * GH; p++) if (own[p] >= 0) { const f = faces[own[p]], x = p % GW; f.cells++; f.sx += x; f.sy += (p - x) / GW; }
     for (const l of inOut) { const p = cellOf(l.x, l.y); if (p >= 0 && own[p] >= 0) faces[own[p]].labels.push(l.rise); }
     for (const pp of porch) { const p = cellOf(pp[0], pp[1]); if (p >= 0 && own[p] >= 0) faces[own[p]].porch = true; }
     faces.forEach(f => {
+      if (!f.cells) { f.area = 0; f.cx = f.cy = 0; f.taken = true; return; }
       f.area = f.cells * cell * cell; f.cx = x0 + (f.sx / f.cells + 0.5) * c; f.cy = y0 + (f.sy / f.cells + 0.5) * c;
       if (f.labels.length) { const cnt = {}; f.labels.forEach(r => cnt[r] = (cnt[r] || 0) + 1); f.pitch = +Object.keys(cnt).sort((a, b) => cnt[b] - cnt[a])[0]; f.labelled = true; }
     });

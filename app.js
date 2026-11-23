@@ -3,7 +3,7 @@
   'use strict';
   const G = window.TakeoffGeom;
   const $ = id => document.getElementById(id);
-  const APP_VERSION = '1.7.1';
+  const APP_VERSION = '1.8.0';
   pdfjsLib.GlobalWorkerOptions.workerSrc = 'vendor/pdf.worker.min.js';
 
   const COLORS = ['#d62728', '#1f77b4', '#2ca02c', '#9467bd', '#ff7f0e', '#8c564b', '#e377c2', '#17becf', '#bcbd22', '#7f7f7f', '#393b79', '#e7298a'];
@@ -476,7 +476,9 @@
     if (it.page !== S.pageNum) { if (it.shapes.some(s => s.pts.length)) { toast('This line is on page ' + it.page + '. Go to that page or add a new line here.', 3500); return; } it.page = S.pageNum; }
     const AT = window.TakeoffAuto;
     const pts = [].concat(...it.shapes.map(s => s.pts));
-    if (pts.length > 1 && !confirm('Replace the points on "' + it.name + '" with the Auto Trace?')) return;
+    // a Roof with a pitch picked ADDS the faces of that pitch as new sections, so nothing is replaced
+    const roofAdd = it.type === 'roof' && +it.pitch > 0;
+    if (!roofAdd && pts.length > 1 && !confirm('Replace the points on "' + it.name + '" with the Auto Trace?')) return;
     spinner(true, 'Finding the walls…');
     await new Promise(r => setTimeout(r, 40));
     const t0 = Date.now();
@@ -485,6 +487,7 @@
       const ck = (S.pdf.fingerprints ? S.pdf.fingerprints[0] : S.proj.pdfName) + '#' + pn;
       if (!segCache[ck]) { for (const k in segCache) delete segCache[k]; segCache[ck] = { segs: await AT.extract(page, pdfjsLib), text: await AT.textItems(page, pdfjsLib) }; }
       const segs = segCache[ck].segs, text = segCache[ck].text;
+      if (AT.isRaster && AT.isRaster(segs)) { spinner(false); alert('This page is a scanned picture, not a CAD drawing, so Auto Trace can\'t read its lines.\n\nTrace it by hand: tap the corners (tap the first point to close).'); return; }
       let sc = scaleOf(pn), readScale = false;
       if (!sc) {
         const ts = AT.scaleFromText(await AT.pageText(page));
@@ -494,23 +497,33 @@
       const ppf = 1 / sc.ftPerPt;
       // where to look: a single tapped point, else the middle of the screen when zoomed in
       let target = pts.length === 1 ? pts[0] : null;
-      if (!target) {
+      if (!target && !roofAdd) { // (a Roof by pitch looks at the whole roof plan – its faces are found by their labels)
         const el = $('viewport'), vw = el.clientWidth / S.view.s, vh = el.clientHeight / S.view.s;
         if (vw * vh < 0.6 * S.pageW * S.pageH) target = [(el.clientWidth / 2 - S.view.tx) / S.view.s, (el.clientHeight / 2 - S.view.ty) / S.view.s];
       }
       const area = G.isArea(it.type);
       let roofNote = '';
       if (it.type === 'roof' && AT.roofByPitch) { const rt = await roofTrace(it, AT, segs, text, ppf, target, sc, readScale); if (rt === true) return; roofNote = rt || ''; }
+      if (roofAdd && pts.length > 1) spinner(false);
+      if (roofAdd && pts.length > 1 && !confirm('No ' + (+it.pitch) + '/12 faces could be picked out on this page. Replace the points on "' + it.name + '" with the whole roof outline?')) { spinner(false); return; }
       let r = AT.run(segs, S.pageW, S.pageH, { ppf, target, text });
       if (r.error && area && it.type !== 'garage_ceiling') r = AT.runSimple(segs, S.pageW, S.pageH, { ppf, target });
       spinner(false);
       if (r.error) { alert(r.error === 'toobig' ? 'That drawing is too big to trace at this scale – check the scale, or zoom in on one plan and try again.' : NOT_FOUND); return; }
       let shapes = [], note = '';
       const loop = poly => ({ pts: poly.concat([poly[0].slice()]), closed: true, autoPt: true });
-      // every wall type: ONE closed loop around the outside face of the exterior walls (garage included)
-      if (it.type === 'garage_ceiling' && r.garage) shapes = [{ pts: r.garage, closed: true }];
-      else if (area) { shapes = [{ pts: r.building, closed: true }]; if (it.type === 'garage_ceiling') note = ' No separate garage found – this is the whole building outline; move points to the garage.'; }
-      else shapes = [loop(r.building)];
+      // walls: ONE closed loop around the outside face of the exterior walls of the house.
+      // v1.8: porches / decks / patios are left out and the garage is its own loop (Garage walls / Garage ceiling lines)
+      const isGar = it.type === 'garage_ceiling' || it.type === 'garage_wall';
+      const outline = isGar && r.garage ? r.garage : r.building;
+      if (area) shapes = [{ pts: outline, closed: true }]; else shapes = [loop(outline)];
+      if (isGar && !r.garage) note = ' No separate garage found – this is the whole building outline; move points to the garage.';
+      else if (!isGar && r.v2) {
+        const bits = [];
+        if (r.hasGarage) bits.push('garage left out (add a <b>Garage walls</b> line and Auto Trace it)');
+        const np = (r.porches || []).length; if (np) bits.push('porch/deck area' + (np === 1 ? '' : 's') + ' left out');
+        if (bits.length) note = '<br>' + bits.join(' · ') + '.';
+      }
       snapshot(it);
       it.shapes = shapes; S.selPt = null;
       autosave(); drawOverlay(); renderPanel(); updateHud();
@@ -518,7 +531,7 @@
       const what = area ? Math.round(c.flat).toLocaleString() + ' sf' : c.lf.toFixed(1) + ' LF';
       zoomToPts(shapes[0].pts);
       const small = Math.max(S.pageW, S.pageH) < 0.9 * 72 * 36 && readScale;
-      traceBanner('✨ Auto Trace: <b>' + what + '</b>' + (area ? ' (flat)' : ' outside of walls') + ' — check the outline on the plan.' + esc(note) + roofNote +
+      traceBanner('✨ Auto Trace: <b>' + what + '</b>' + (area ? ' (flat)' : ' outside of walls') + ' — check the outline on the plan.' + (note.startsWith('<br>') ? note : esc(note)) + roofNote +
         (readScale ? '<br>Scale ' + esc(String(sc.short).replace(/\s*read$/, '')) + ' was read from the page' + (small ? ' – this sheet looks REDUCED, calibrate!' : ' – verify with 📐 Check.') : ''));
       window.__lastTrace = r;
     } catch (e) { console.error(e); spinner(false); alert(NOT_FOUND + '\n(' + e.message + ')'); }
@@ -527,32 +540,54 @@
   /* Roof with a pitch picked: trace only the roof faces labelled with that pitch (e.g. 8:12).
      Returns true when it handled the trace (or told him why not); false = fall through to the whole outline. */
   async function roofTrace(it, AT, segs, text, ppf, target, sc, readScale) {
+    // faces already traced – in other Roof lines on this page AND in this roof's own sections – are not traced again
     const others = S.proj.items.filter(o => o.type === 'roof' && o.id !== it.id && o.page === S.pageNum);
-    const exclude = [].concat(...others.map(o => o.shapes.filter(sh => sh.pts.length >= 3).map(sh => sh.pts)));
+    const own = it.shapes.filter(sh => sh.pts.length >= 3).map(sh => sh.pts);
+    const exclude = [].concat(...others.map(o => o.shapes.filter(sh => sh.pts.length >= 3).map(sh => sh.pts)), own);
     const r = AT.roofByPitch(segs, S.pageW, S.pageH, { ppf, target, text, pitch: +it.pitch, exclude });
     if (r.error) return false;
     spinner(false);
     const P = +it.pitch + '/12', list = a => (a || []).map(x => x + '/12').join(', ');
-    if (r.reason === 'alltaken') { alert('The ' + P + ' roof faces on this page are already in another Roof line (' + others.map(o => o.name).join(', ') + '). Nothing changed.'); return true; }
+    // what is still untraced on this page, by pitch: "12/12 ×2 faces (≈640 sf flat)"
+    const leftHtml = picked => {
+      const left = {};
+      (r.faces || []).forEach((f, k) => { if (f.taken || !f.pitch || f.area < 3 || (picked && f.pitch === +it.pitch)) return; const L = left[f.pitch] || (left[f.pitch] = { n: 0, a: 0 }); L.n++; L.a += f.area; });
+      const ks = Object.keys(left).map(Number).sort((a, b) => b - a);
+      if (!ks.length) return '<br>✔ Every labelled roof face on this page is traced.';
+      return '<br>Still to trace: ' + ks.map(k => '<b>' + k + '/12</b> ×' + left[k].n + ' face' + (left[k].n === 1 ? '' : 's') + ' (≈' + Math.round(left[k].a).toLocaleString() + ' sf flat)').join(', ') + ' – pick the next pitch and tap Auto Trace again.';
+    };
+    if (r.reason === 'alltaken') { traceBanner('The ' + P + ' roof faces on this page are already traced' + (others.length ? ' (here or in ' + esc(others.map(o => o.name).join(', ')) + ')' : '') + '. Nothing added.' + leftHtml(true), 12000); return true; }
     const roofPlan = r.pitches && r.pitches.length > 0;
     if (r.mode !== 'pitch' && !roofPlan) { // no pitch labels on this page: the normal whole-outline trace runs, with a note
       return +it.pitch ? '<br>⚠ No pitch labels found on this page – this is the <b>whole outline</b>. Move points or change the pitch.' : '';
     }
-    const shapes = r.mode === 'pitch' ? r.sections.map(pts => ({ pts, closed: true })) : [{ pts: r.building, closed: true }];
-    snapshot(it); it.shapes = shapes; S.selPt = null;
+    let added = 0;
+    if (r.mode === 'pitch') {
+      // ADD one section per traced face group at this pitch (an empty section waiting for taps is used up first)
+      const last = it.shapes[it.shapes.length - 1];
+      if (last && !last.pts.length) it.shapes.pop();
+      it.shapes.forEach(sh => { if (sh.pts.length) sh.closed = true; });
+      r.sections.forEach(pts => { it.shapes.push({ pts, closed: true, pitch: +it.pitch, auto: true }); added++; });
+    } else {
+      if (own.length && !confirm('No ' + P + ' faces could be picked out on this roof plan. Replace the points on "' + it.name + '" with the whole roof outline?')) return true;
+      it.shapes = [{ pts: r.building, closed: true, pitch: +it.pitch }];
+    }
+    S.selPt = null; S.activeId = it.id;
     autosave(); drawOverlay(); renderPanel(); updateHud();
-    const c = calc(it), n = shapes.length;
-    zoomToPts([].concat(...shapes.map(sh => sh.pts)));
+    const newSh = r.mode === 'pitch' ? it.shapes.slice(-added) : it.shapes;
+    let flat = 0; newSh.forEach(sh => { flat += G.polygonArea(sh.pts) * sc.ftPerPt * sc.ftPerPt; });
+    zoomToPts([].concat(...newSh.map(sh => sh.pts)));
+    const c = calc(it);
     let msg;
     if (r.mode !== 'pitch') {
-      msg = '✨ Whole roof outline: <b>' + Math.round(c.flat).toLocaleString() + ' sf flat</b>' + (+it.pitch ? ' × ' + G.pitchFactor(it.pitch).toFixed(3) + ' = <b>' + Math.round(c.flat * G.pitchFactor(it.pitch)).toLocaleString() + ' sf</b>' : '') + '.';
+      msg = '✨ Whole roof outline: <b>' + Math.round(flat).toLocaleString() + ' sf flat</b>' + (+it.pitch ? ' × ' + G.pitchFactor(it.pitch).toFixed(3) + ' = <b>' + Math.round(flat * G.pitchFactor(it.pitch)).toLocaleString() + ' sf</b>' : '') + '.';
       if (+it.pitch) msg += '<br>⚠ No ' + P + ' label found on this roof plan (found ' + list(r.pitches) + ') – so this is the whole roof. Move points or change the pitch.';
       else msg += '<br>Pitches on this plan: ' + list(r.pitches) + ' – pick one on the Roof line to trace just those faces.';
       if (r.porchNear) msg += '<br>A porch roof may be inside this outline – check it.';
     } else {
-      msg = '✨ Roof ' + P + ': <b>' + Math.round(c.flat).toLocaleString() + ' sf flat</b> × ' + G.pitchFactor(it.pitch).toFixed(3) + ' = <b>' + Math.round(c.flat * G.pitchFactor(it.pitch)).toLocaleString() + ' sf</b> · ' + n + ' section' + (n === 1 ? '' : 's') + ' (faces labelled ' + P + ').';
-      if (r.otherPitches && r.otherPitches.length) msg += '<br>Other pitches on this plan: ' + list(r.otherPitches) + ' – add a Roof line for each.';
+      msg = '✨ Added ' + added + ' section' + (added === 1 ? '' : 's') + ' at ' + P + ': <b>' + Math.round(flat).toLocaleString() + ' sf flat</b> × ' + G.pitchFactor(it.pitch).toFixed(3) + ' = <b>' + Math.round(flat * G.pitchFactor(it.pitch)).toLocaleString() + ' sf</b>. ' + esc(it.name) + ' total now <b>' + Math.round(c.sf).toLocaleString() + ' sf</b>.';
       if (r.porchNote) msg += '<br>⚠ This looks like a porch roof – check whether to count it.';
+      msg += leftHtml(true);
     }
     if (readScale) msg += '<br>Scale ' + esc(String(sc.short).replace(/\s*read$/, '')) + ' was read from the page – verify with 📐 Check.';
     traceBanner(msg + ' Check the outline on the plan.', 20000);
@@ -567,7 +602,7 @@
     applyView(); scheduleDetail();
   }
   function traceBanner(html, ms) {
-    const h = $('hud'); h.innerHTML = '<div id="traceBanner">' + html + ' <button id="tbOk" class="okc">OK</button></div>';
+    const h = $('hud'); h.innerHTML = '<div id="traceBanner"><div class="tbText">' + html + '</div> <button id="tbOk" class="okc">OK</button></div>';
     $('tbOk').onclick = () => { h.innerHTML = ''; updateHud(); };
     clearTimeout(traceBanner._t); traceBanner._t = setTimeout(() => { if ($('traceBanner')) { h.innerHTML = ''; updateHud(); } }, ms || 12000);
   }
@@ -863,7 +898,7 @@
       '<li><b>Find a line on the plan:</b> press and hold inside any measured area (or on a wall line) for half a second – that line item gets selected in the list, and for a roof its section lights up.</li>' +
       '<li><b>Roofs with several pitches:</b> tap <b>+ Roof</b>, name it (Main House, Garage Roof…) and pick the first pitch. Trace that section. Tap <b>＋ Section</b> on the roof card, pick the next pitch and trace it – each roof keeps its own list of sections. Each section has its own pitch dropdown you can change any time; its sloped sf = flat sf × pitch factor, and the roof total adds up all its sections. Tap a section number to show it on the plan. <b>All roofs</b> in the totals adds every roof.</li>' +
       '<li><b>Jogs / bump-outs:</b> press and hold anywhere on a line (about half a second) until it pulses, then drag without lifting – a new corner follows your finger. Or tap/drag the <b>+</b> in the middle of a line. To remove a point, press and hold it, then tap <b>🗑 Delete point</b>. Undo works for all of these.</li>' +
-      '<li><b>✨ Auto Trace</b> (CAD/vector PDFs, not scans): add a line (Walls, Roof, Garage…) and tap <b>Auto Trace this page</b>. It draws ONE loop around the outside of the exterior walls – garage included – and zooms to it with the LF shown at the top. Move points to take out the garage or porches. Sheet with several plans? Zoom in on the one you want, or tap one spot inside it first. It skips schedules, notes and the title block. Shrunk printouts (11×17): calibrate the scale first. Undo puts it back.</li>' +
+      '<li><b>✨ Auto Trace</b> (CAD/vector PDFs – scanned pages get a message instead): add a line and tap <b>Auto Trace this page</b>. <b>Walls</b>: one loop around the outside of the exterior walls of the house – it follows the double wall lines, skips hatching, dimension and dashed lines, and leaves out porches, decks, patios and the garage. <b>Garage walls / Garage ceiling</b>: just the garage. <b>Roof</b>: pick a pitch (say 8/12) and tap Auto Trace – it adds every face labelled 8/12 as sections; pick the next pitch and repeat. Faces already traced are skipped and the banner shows what is still to trace. Sheet with several plans? Zoom in on the one you want first. Move any point to fix it; Undo puts it back.</li>' +
       '<li><b>✨ Roof by pitch</b>: on the roof plan page add a Roof line, pick its pitch (e.g. 8/12), then Auto Trace. It traces only the roof faces labelled with that pitch (8:12, 8/12, 7"/12" or a pitch triangle) – one section per area – and skips faces you already put in another Roof line on that page, so do one Roof line per pitch. If it finds no matching label it traces the whole roof outline and says so. Pitch 0/12 (flat / none) = whole outline. Porch roofs get a ⚠ note; always check the faces against the plan.</li>' +
       '<li><b>⊾ Square</b> keeps lines straight up/down or left/right.</li>' +
       '<li>Tap <b>Done</b> when that line is finished.</li>' +
